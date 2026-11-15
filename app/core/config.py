@@ -86,7 +86,8 @@ def validate_security_configuration(s: Settings = settings) -> None:
             )
         if s.ENCRYPTION_KEY == DEV_ENCRYPTION_KEY:
             raise RuntimeError(
-                "Production startup failed: ENCRYPTION_KEY cannot use the default development key."
+                "Production startup failed: ENCRYPTION_KEY cannot use the default development key. "
+                "In Render Dashboard -> Environment, set ENCRYPTION_KEY to a dedicated Fernet key (e.g. cOOe1mO4arWvmsu8yf2a7aeAQkkTEgq8LQtlDydLA5U=)."
             )
         try:
             from app.services.crypto import normalize_fernet_key
@@ -105,7 +106,8 @@ def validate_security_configuration(s: Settings = settings) -> None:
             )
         if s.GITHUB_WEBHOOK_SECRET == DEV_WEBHOOK_SECRET:
             raise RuntimeError(
-                "Production startup failed: GITHUB_WEBHOOK_SECRET cannot use the default development secret."
+                "Production startup failed: GITHUB_WEBHOOK_SECRET cannot use the default development secret. "
+                "In Render Dashboard -> Environment, set GITHUB_WEBHOOK_SECRET to a dedicated secret (e.g. 0a95b030b9b00fd899bd41a35ae1693ca0ff113d9774c11f89a15f3563dfd3d1)."
             )
         if s.GITHUB_WEBHOOK_SECRET == s.SECRET_KEY:
             raise RuntimeError(
