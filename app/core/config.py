@@ -89,10 +89,12 @@ def validate_security_configuration(s: Settings = settings) -> None:
                 "Production startup failed: ENCRYPTION_KEY cannot use the default development key."
             )
         try:
-            Fernet(s.ENCRYPTION_KEY.encode().strip())
+            from app.services.crypto import normalize_fernet_key
+            norm_key = normalize_fernet_key(s.ENCRYPTION_KEY)
+            Fernet(norm_key)
         except Exception as e:
             raise RuntimeError(
-                f"Production startup failed: ENCRYPTION_KEY is invalid: {e}. Must be a valid Fernet key."
+                f"Production startup failed: ENCRYPTION_KEY is invalid: {e}. Must be at least 32 characters or a valid Fernet key."
             )
 
         # 3. Dedicated GITHUB_WEBHOOK_SECRET validation

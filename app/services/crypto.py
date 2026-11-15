@@ -32,6 +32,25 @@ class DecryptionError(CryptoError):
     pass
 
 
+def normalize_fernet_key(key: str) -> bytes:
+    """
+    Normalizes key string into 32 urlsafe base64-encoded bytes for Fernet.
+    Handles:
+    - Standard 44-character urlsafe base64 Fernet keys.
+    - Cloud/platform generated 32+ character raw alphanumeric secrets.
+    """
+    clean = key.strip().encode("utf-8")
+    try:
+        Fernet(clean)
+        return clean
+    except Exception:
+        if len(clean) >= 32:
+            derived = base64.urlsafe_b64encode(clean[:32])
+            Fernet(derived)
+            return derived
+        raise
+
+
 def _get_active_fernets() -> MultiFernet:
     """
     Construct MultiFernet instance using primary key and any configured rotation keys.
@@ -43,7 +62,7 @@ def _get_active_fernets() -> MultiFernet:
     # 1. Primary key - dedicated independent Fernet key
     if settings.ENCRYPTION_KEY and settings.ENCRYPTION_KEY.strip():
         try:
-            k = settings.ENCRYPTION_KEY.encode().strip()
+            k = normalize_fernet_key(settings.ENCRYPTION_KEY)
             Fernet(k)
             keys.append(k)
         except Exception as e:
@@ -57,11 +76,12 @@ def _get_active_fernets() -> MultiFernet:
     # 2. Previous keys for seamless rotation
     if settings.PREVIOUS_ENCRYPTION_KEYS and settings.PREVIOUS_ENCRYPTION_KEYS.strip():
         for prev in settings.PREVIOUS_ENCRYPTION_KEYS.split(","):
-            prev_clean = prev.strip().encode()
+            prev_clean = prev.strip()
             if prev_clean:
                 try:
-                    Fernet(prev_clean)
-                    keys.append(prev_clean)
+                    pk = normalize_fernet_key(prev_clean)
+                    Fernet(pk)
+                    keys.append(pk)
                 except Exception as e:
                     raise CryptoError(f"Invalid rotation key in PREVIOUS_ENCRYPTION_KEYS: {e}")
 
