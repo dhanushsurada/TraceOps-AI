@@ -17,7 +17,8 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models.models import AIProxyLog, Event
+from app.models.models import AIProxyLog, Event, User
+from app.api.auth.deps import get_optional_user
 
 router = APIRouter(prefix="/proxy", tags=["AI Proxy"])
 
@@ -81,8 +82,10 @@ async def _log_to_db(
     completion_tokens: Optional[int],
     latency_ms: int,
     error: Optional[str] = None,
+    user_id: Optional[str] = None,
 ):
     log = AIProxyLog(
+        user_id=user_id,
         task_id=task_id,
         provider=provider,
         prompt=prompt,
@@ -97,6 +100,7 @@ async def _log_to_db(
     # Also emit a TraceOps event
     has_output = bool(response and len(response.strip()) > 10)
     event = Event(
+        user_id=user_id,
         task_id=task_id,
         event_type="ai",
         source=f"proxy:{provider}",
@@ -120,6 +124,7 @@ async def _log_to_db(
 @router.post("/openai")
 async def proxy_openai(
     req: ProxyRequest,
+    current_user: Optional[User] = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
     authorization: Optional[str] = Header(None),
     x_openai_key: Optional[str] = Header(None, alias="X-OpenAI-Key"),
@@ -168,8 +173,9 @@ async def proxy_openai(
         prompt_tokens = usage.get("prompt_tokens")
         completion_tokens = usage.get("completion_tokens")
 
+        uid = current_user.id if current_user else None
         await _log_to_db(db, req.task_id, "openai", prompt_text, resp_text,
-                         prompt_tokens, completion_tokens, latency_ms)
+                         prompt_tokens, completion_tokens, latency_ms, user_id=uid)
         return data
 
     except HTTPException:
@@ -177,8 +183,9 @@ async def proxy_openai(
     except Exception as exc:
         latency_ms = int((time.monotonic() - start) * 1000)
         error_str = str(exc)[:300]
+        uid = current_user.id if current_user else None
         await _log_to_db(db, req.task_id, "openai", prompt_text, None,
-                         None, None, latency_ms, error_str)
+                         None, None, latency_ms, error_str, user_id=uid)
         raise HTTPException(status_code=502, detail=f"Upstream error: {error_str}")
 
 
@@ -187,6 +194,7 @@ async def proxy_openai(
 @router.post("/anthropic")
 async def proxy_anthropic(
     req: ProxyRequest,
+    current_user: Optional[User] = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
     x_anthropic_key: Optional[str] = Header(None, alias="X-Anthropic-Key"),
 ):
@@ -235,8 +243,9 @@ async def proxy_anthropic(
         prompt_tokens = usage.get("input_tokens")
         completion_tokens = usage.get("output_tokens")
 
+        uid = current_user.id if current_user else None
         await _log_to_db(db, req.task_id, "anthropic", prompt_text, resp_text,
-                         prompt_tokens, completion_tokens, latency_ms)
+                         prompt_tokens, completion_tokens, latency_ms, user_id=uid)
         return data
 
     except HTTPException:
@@ -244,6 +253,7 @@ async def proxy_anthropic(
     except Exception as exc:
         latency_ms = int((time.monotonic() - start) * 1000)
         error_str = str(exc)[:300]
+        uid = current_user.id if current_user else None
         await _log_to_db(db, req.task_id, "anthropic", prompt_text, None,
-                         None, None, latency_ms, error_str)
+                         None, None, latency_ms, error_str, user_id=uid)
         raise HTTPException(status_code=502, detail=f"Upstream error: {error_str}")

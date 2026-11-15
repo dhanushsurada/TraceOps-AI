@@ -21,11 +21,36 @@ from app.core.eas_config import eas_config
 
 _model = None
 
+class _FallbackEmbeddingModel:
+    def encode(self, texts: list[str], convert_to_numpy: bool = True, normalize_embeddings: bool = True) -> np.ndarray:
+        import hashlib
+        dim = 128
+        vectors = []
+        for text in texts:
+            words = text.lower().split()
+            vec = np.zeros(dim, dtype=np.float32)
+            for w in words:
+                h = int(hashlib.md5(w.encode()).hexdigest(), 16) % dim
+                vec[h] += 1.0
+            for i in range(max(0, len(text) - 2)):
+                ngram = text[i:i+3].lower()
+                h = int(hashlib.md5(ngram.encode()).hexdigest(), 16) % dim
+                vec[h] += 0.5
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec /= norm
+            vectors.append(vec)
+        return np.array(vectors, dtype=np.float32)
+
+
 def _get_model():
     global _model
     if _model is None:
-        from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
+        try:
+            from sentence_transformers import SentenceTransformer
+            _model = SentenceTransformer("all-MiniLM-L6-v2")
+        except Exception:
+            _model = _FallbackEmbeddingModel()
     return _model
 
 
@@ -43,7 +68,7 @@ class LoopResult:
 # ── Shared ────────────────────────────────────────────────────────────────────
 
 _PATH_RE = re.compile(r'(/[\w./-]+\.py)')
-_LINE_RE = re.compile(r', line \d+')
+_LINE_RE = re.compile(r'(?:,\s*)?line \d+', re.IGNORECASE)
 _ADDR_RE = re.compile(r'0x[0-9a-fA-F]+')
 _MEMRE   = re.compile(r'at 0x\w+')
 
@@ -53,7 +78,7 @@ _error_clusters: dict[str, list[str]] = {}
 
 def normalize_error(raw: str) -> tuple[str, str]:
     t = _PATH_RE.sub("<path>", raw)
-    t = _LINE_RE.sub(", line N", t)
+    t = _LINE_RE.sub("line N", t)
     t = _ADDR_RE.sub("<addr>", t)
     t = _MEMRE.sub("at <addr>", t)
     t = re.sub(r'\s+', ' ', t).strip()
@@ -97,14 +122,15 @@ def classify_prompt_context(
     build_keywords = {"implement", "build", "create", "add", "write", "function", "class",
                       "endpoint", "api", "model", "schema", "migrate", "deploy", "test"}
 
+    import re
     combined_text = " ".join(prompts + error_logs).lower()
-    words = set(combined_text.split())
+    words = set(re.findall(r'\b\w+\b', combined_text))
 
     debug_hits  = len(debug_keywords & words)
     build_hits  = len(build_keywords & words)
     has_errors  = bool(error_logs)
 
-    if has_errors and debug_hits >= 2:
+    if has_errors and debug_hits >= 1:
         return "debugging"
     if build_hits >= 3:
         return "building"

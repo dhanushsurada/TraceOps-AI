@@ -40,6 +40,8 @@ class JSONFormatter(logging.Formatter):
         for k, v in record.__dict__.items():
             if k.startswith("traceops_"):
                 payload[k[9:]] = v  # strip "traceops_" prefix
+            elif k.startswith("eas_"):
+                payload[k[4:]] = v  # strip "eas_" prefix for backwards compatibility
 
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)

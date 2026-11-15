@@ -1,12 +1,12 @@
 """
-Report API
+Report API with Strict Tenant Isolation
 
-GET  /report/daily       — get today's report (generate if missing)
-GET  /report/{date}      — get report for specific date (YYYY-MM-DD)
-POST /report/generate    — force-generate report for today
+GET  /report/daily       — get today's report (scoped to authenticated user)
+GET  /report/{date}      — get report for specific date (YYYY-MM-DD, user-scoped)
+POST /report/generate    — force-generate report for today (user-scoped)
 POST /report/validate    — run deployment validation on a URL
 """
-from datetime import date, datetime
+from datetime import date as dt_date, datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -14,8 +14,9 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.auth.deps import get_current_user, get_optional_user
 from app.core.database import get_db
-from app.models.models import Event, Report, Score, Task
+from app.models.models import Event, Report, Score, Task, User
 from app.services.deployment import validate_deployment
 from app.services.llm_analyzer import run_analysis
 from app.services.loop_detection import detect_all_loops
@@ -32,28 +33,28 @@ class ValidateRequest(BaseModel):
     functional_expected_keys: Optional[list[str]] = None
 
 
-# ── Core: build today's report data ─────────────────────────────────────────
+# ── Core: build today's report data scoped to user ───────────────────────────
 
-async def _generate_report_for_date(target_date: date, db: AsyncSession) -> dict:
-    # Fetch all tasks for the date
+async def _generate_report_for_date(target_date: dt_date, user_id: str, db: AsyncSession) -> dict:
+    # Fetch all tasks for the date strictly scoped to this user
     task_result = await db.execute(
-        select(Task).where(Task.date == target_date)
+        select(Task).where(Task.task_date == target_date, Task.user_id == user_id)
     )
     tasks = task_result.scalars().all()
     if not tasks:
         return {
-            "meta": {"date": target_date.isoformat()},
+            "meta": {"date": target_date.isoformat(), "user_id": user_id},
             "summary": {"total_tasks": 0, "completed_tasks": 0, "average_score": 0, "score_grade": "N/A"},
             "tasks": [],
             "scores": [],
             "loop_detection": [],
             "deployment_validation": [],
-            "analysis": {"bottlenecks": [], "root_cause": "No tasks recorded.", "corrective_actions": []},
+            "analysis": {"bottlenecks": [], "root_cause": "No tasks recorded for today.", "corrective_actions": []},
         }
 
     task_ids = [t.id for t in tasks]
 
-    # Fetch events
+    # Fetch events for user's tasks
     ev_result = await db.execute(
         select(Event).where(Event.task_id.in_(task_ids))
     )
@@ -100,36 +101,35 @@ async def _generate_report_for_date(target_date: date, db: AsyncSession) -> dict
         for s in scores
     ]
 
-    # Aggregate events for LLM analysis
-    all_events_dicts = [
-        {
-            "event_type": e.event_type,
-            "timestamp": e.timestamp.isoformat() if e.timestamp else None,
-            "metadata": e.metadata_ or {},
-        }
-        for e in all_events
-    ]
+    # Missing scores computation
+    scored_task_ids = {s.task_id for s in scores}
+    for task in tasks:
+        if task.id not in scored_task_ids and task.status == "completed":
+            task_events = [e for e in all_events if e.task_id == task.id]
+            ev_dicts = [
+                {"event_type": e.event_type, "timestamp": e.timestamp, "metadata": e.metadata_ or {}}
+                for e in task_events
+            ]
+            bd = score_from_task_data(
+                {
+                    "target_level": task.target_level,
+                    "final_level": task.final_level or task.target_level,
+                    "started_at": task.started_at,
+                    "ended_at": task.ended_at,
+                },
+                ev_dicts,
+            )
+            scores_dicts.append({
+                "task_id": task.id,
+                "level": bd.level,
+                "velocity": bd.velocity,
+                "stability_penalty": bd.stability_penalty,
+                "ai_penalty": bd.ai_penalty,
+                "final_score": bd.final_score,
+                "outcome_score": bd.outcome_score,
+            })
 
-    # Summarize tasks for LLM
-    completed = [t for t in tasks if t.status == "completed"]
-    avg_score = (
-        sum(s["final_score"] for s in scores_dicts) / len(scores_dicts)
-        if scores_dicts else 0
-    )
-    task_summary = {
-        "goal": f"{len(tasks)} tasks, {len(completed)} completed",
-        "target_level": max((t.target_level for t in tasks), default=0),
-        "final_level": max((t.final_level or 0 for t in tasks), default=0),
-        "started_at": min((t.started_at for t in tasks), default=None),
-        "ended_at": max((t.ended_at for t in tasks if t.ended_at), default=None),
-    }
-
-    analysis = await run_analysis(
-        task_data=task_summary,
-        events=all_events_dicts,
-        score={"average_score": round(avg_score, 1), "scores": scores_dicts},
-    )
-
+    # Task dicts
     tasks_dicts = [
         {
             "id": t.id,
@@ -137,14 +137,32 @@ async def _generate_report_for_date(target_date: date, db: AsyncSession) -> dict
             "target_level": t.target_level,
             "final_level": t.final_level,
             "status": t.status,
-            "started_at": t.started_at,
-            "ended_at": t.ended_at,
+            "started_at": t.started_at.isoformat() if t.started_at else None,
+            "ended_at": t.ended_at.isoformat() if t.ended_at else None,
         }
         for t in tasks
     ]
 
+    # LLM Bottleneck analysis
+    analysis = None
+    if tasks:
+        lead_task = tasks[0]
+        lead_score = next((s for s in scores_dicts if s["task_id"] == lead_task.id), {})
+        lead_events = [
+            {"event_type": e.event_type, "timestamp": e.timestamp.isoformat() if e.timestamp else None, "metadata": e.metadata_ or {}}
+            for e in all_events if e.task_id == lead_task.id
+        ]
+        try:
+            analysis = await run_analysis(
+                task_data={"goal": lead_task.goal, "target_level": lead_task.target_level, "final_level": lead_task.final_level},
+                events=lead_events,
+                score=lead_score,
+            )
+        except Exception:
+            analysis = None
+
     return build_report(
-        report_date=target_date,
+        target_date=target_date,
         tasks=tasks_dicts,
         scores=scores_dicts,
         analysis=analysis,
@@ -156,42 +174,62 @@ async def _generate_report_for_date(target_date: date, db: AsyncSession) -> dict
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
 @router.get("/daily")
-async def get_daily_report(db: AsyncSession = Depends(get_db)):
-    """Return today's report from DB, or generate if missing."""
-    today = date.today()
+async def get_daily_report(
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return today's report from DB for authenticated user, or generate if missing."""
+    today = dt_date.today()
+    user_id = current_user.id if current_user else "default_user"
+
     result = await db.execute(
-        select(Report).where(Report.date == today).order_by(Report.created_at.desc()).limit(1)
+        select(Report)
+        .where(Report.report_date == today, Report.user_id == user_id)
+        .order_by(Report.created_at.desc())
+        .limit(1)
     )
     existing = result.scalar_one_or_none()
     if existing:
         return existing.content
 
     # Generate fresh
-    content = await _generate_report_for_date(today, db)
-    report_row = Report(date=today, content=content)
+    content = await _generate_report_for_date(today, user_id, db)
+    report_row = Report(user_id=user_id, report_date=today, content=content)
     db.add(report_row)
     await db.commit()
     return content
 
 
 @router.get("/daily/markdown")
-async def get_daily_report_markdown(db: AsyncSession = Depends(get_db)):
+async def get_daily_report_markdown(
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Return today's report as a Markdown string."""
     from fastapi.responses import PlainTextResponse
-    today = date.today()
-    content = await _generate_report_for_date(today, db)
+    today = dt_date.today()
+    user_id = current_user.id if current_user else "default_user"
+    content = await _generate_report_for_date(today, user_id, db)
     return PlainTextResponse(report_to_markdown(content), media_type="text/markdown")
 
 
 @router.get("/{report_date}")
-async def get_report_by_date(report_date: str, db: AsyncSession = Depends(get_db)):
+async def get_report_by_date(
+    report_date: str,
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+):
     try:
-        d = date.fromisoformat(report_date)
+        d = dt_date.fromisoformat(report_date)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
+    user_id = current_user.id if current_user else "default_user"
     result = await db.execute(
-        select(Report).where(Report.date == d).order_by(Report.created_at.desc()).limit(1)
+        select(Report)
+        .where(Report.report_date == d, Report.user_id == user_id)
+        .order_by(Report.created_at.desc())
+        .limit(1)
     )
     report = result.scalar_one_or_none()
     if not report:
@@ -200,11 +238,15 @@ async def get_report_by_date(report_date: str, db: AsyncSession = Depends(get_db
 
 
 @router.post("/generate", status_code=201)
-async def force_generate_report(db: AsyncSession = Depends(get_db)):
-    """Force-generate and store today's report (overwrites existing)."""
-    today = date.today()
-    content = await _generate_report_for_date(today, db)
-    report_row = Report(date=today, content=content)
+async def force_generate_report(
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Force-generate and store today's report for current user."""
+    today = dt_date.today()
+    user_id = current_user.id if current_user else "default_user"
+    content = await _generate_report_for_date(today, user_id, db)
+    report_row = Report(user_id=user_id, report_date=today, content=content)
     db.add(report_row)
     await db.commit()
     return {"message": "Report generated.", "date": today.isoformat(), "report": content}

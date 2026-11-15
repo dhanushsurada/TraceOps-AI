@@ -19,8 +19,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.models.models import Integration, OAuthState, User
+from app.models.models import Integration, OAuthState, User, Project, Commit
 from app.api.auth.deps import get_current_user
+from app.services.crypto import encrypt_secret, decrypt_secret
 
 router = APIRouter(prefix="/integrations", tags=["Integrations"])
 
@@ -372,8 +373,9 @@ async def connect_api_key(
         )
     )
     integ = result.scalar_one_or_none()
+    encrypted_key = encrypt_secret(req.api_key)
     if integ:
-        integ.access_token       = req.api_key   # TODO: encrypt in production
+        integ.access_token       = encrypted_key
         integ.status             = "connected"
         integ.provider_username  = username
         integ.connected_at       = datetime.now(timezone.utc)
@@ -381,7 +383,7 @@ async def connect_api_key(
         integ = Integration(
             user_id=current_user.id,
             provider=provider,
-            access_token=req.api_key,
+            access_token=encrypted_key,
             status="connected",
             provider_username=username,
             metadata_=req.extra,
@@ -496,11 +498,11 @@ async def _validate_wakatime_key(api_key: str) -> Optional[str]:
 
 
 async def _sync_github(integ: Integration, user_id: str, db: AsyncSession) -> dict:
-    """Pull recent commits from all user's GitHub repos and store as events."""
-    from app.models.models import Event
+    """Pull recent commits from all user's GitHub repos and store as ontology Commits and Events with deduplication."""
+    from app.models.models import Event, Project, Commit
     from app.services.normalizer import normalize_github_commit
 
-    token = integ.access_token
+    token = decrypt_secret(integ.access_token)
     if not token:
         return {"synced": False, "message": "No GitHub token found."}
 
@@ -518,38 +520,79 @@ async def _sync_github(integ: Integration, user_id: str, db: AsyncSession) -> di
             total_commits = 0
 
             for repo in repos[:5]:  # limit to 5 repos on free tier
+                # Ensure Project exists in ontology
+                proj_res = await db.execute(
+                    select(Project).where(Project.user_id == user_id, Project.slug == repo["full_name"])
+                )
+                project = proj_res.scalar_one_or_none()
+                if not project:
+                    project = Project(
+                        user_id=user_id,
+                        name=repo.get("name", "Unnamed Repo"),
+                        slug=repo["full_name"],
+                        repository_url=repo.get("html_url"),
+                        default_branch=repo.get("default_branch", "main"),
+                        visibility="public" if not repo.get("private") else "private",
+                    )
+                    db.add(project)
+                    await db.flush()
+
                 commits_r = await client.get(
-                    f"https://api.github.com/repos/{repo['full_name']}/commits?per_page=10",
+                    f"https://api.github.com/repos/{repo['full_name']}/commits?per_page=15",
                     headers={"Authorization": f"Bearer {token}"},
                 )
                 if commits_r.status_code != 200:
                     continue
                 commits = commits_r.json()
-                pseudo = {
-                    "commits": [
-                        {
-                            "id": c["sha"],
-                            "message": c["commit"]["message"],
-                            "timestamp": c["commit"]["author"]["date"],
-                            "author": {"name": c["commit"]["author"]["name"]},
-                            "url": c["html_url"],
-                            "added": [], "modified": [], "removed": [],
-                        }
-                        for c in commits
-                    ]
-                }
-                normalized = normalize_github_commit(pseudo)
-                for ne in normalized:
+
+                for c in commits:
+                    sha = c["sha"]
+                    # Deduplication check: if commit already stored for this project, skip
+                    c_exists = await db.execute(
+                        select(Commit).where(Commit.project_id == project.id, Commit.sha == sha)
+                    )
+                    if c_exists.scalar_one_or_none():
+                        continue
+
+                    msg = c["commit"]["message"]
+                    author_name = c["commit"]["author"]["name"]
+                    author_email = c["commit"]["author"].get("email")
+                    c_date_raw = c["commit"]["author"]["date"]
+                    committed_at = datetime.fromisoformat(c_date_raw.replace("Z", "+00:00"))
+
+                    # Look for [TRO-<task_id>] in commit message
+                    import re
+                    task_id_match = re.search(r'\[TRO-([0-9a-fA-F-]+)\]', msg)
+                    task_id = task_id_match.group(1) if task_id_match else None
+
+                    commit_record = Commit(
+                        user_id=user_id,
+                        project_id=project.id,
+                        task_id=task_id,
+                        sha=sha,
+                        message=msg,
+                        author_name=author_name,
+                        author_email=author_email,
+                        committed_at=committed_at,
+                        url=c.get("html_url"),
+                        raw_payload={"sha": sha, "url": c.get("html_url")},
+                    )
+                    db.add(commit_record)
+
+                    # Also store normalized event
                     event = Event(
                         user_id=user_id,
-                        task_id=ne.get("task_id"),
+                        task_id=task_id,
                         event_type="commit",
                         source=f"github:sync:{repo['full_name']}",
-                        raw_data=ne,
-                        metadata_=ne.get("metadata"),
+                        raw_data={"sha": sha, "message": msg, "author": author_name, "url": c.get("html_url")},
+                        metadata_={"sha": sha, "message": msg, "author": author_name},
                     )
                     db.add(event)
                     total_commits += 1
+
+            integ.last_synced_at = datetime.now(timezone.utc)
+            await db.commit()
 
         return {"synced": True, "commits_imported": total_commits, "repos_scanned": min(len(repos), 5)}
     except Exception as e:

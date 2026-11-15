@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api import events, metrics, proxy, reports, tasks
+from app.api import projects, graph, observations, assessments, context, content
 from app.api.auth.routes import router as auth_router
 from app.api.integrations.routes import router as integrations_router
 from app.api.user import router as user_router
@@ -33,7 +34,9 @@ async def lifespan(app: FastAPI):
         # Import all models so metadata is populated
         from app.models.models import (
             User, UserSession, Integration, OAuthState,
-            Task, Event, Score, Report, AIProxyLog,
+            Project, Task, Commit, FileChange, PullRequest,
+            Deployment, ErrorRecord, Decision, AISession, AIPrompt,
+            Event, GraphEdge, Observation, Assessment, Score, Report, AIProxyLog,
         )
         from app.services.webhook_durability import WebhookEvent
         from app.services.config_store import ConfigStore
@@ -83,8 +86,14 @@ async def logging_middleware(request: Request, call_next):
 app.include_router(auth_router)
 app.include_router(integrations_router)
 app.include_router(user_router)
+app.include_router(projects.router)
 app.include_router(tasks.router)
 app.include_router(events.router)
+app.include_router(graph.router)
+app.include_router(observations.router)
+app.include_router(assessments.router)
+app.include_router(context.router)
+app.include_router(content.router)
 app.include_router(reports.router)
 app.include_router(proxy.router)
 app.include_router(metrics.router)

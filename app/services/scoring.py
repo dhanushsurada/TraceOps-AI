@@ -9,7 +9,7 @@ Upgrades from v2:
 """
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 from app.core.eas_config import eas_config
 
@@ -70,17 +70,34 @@ def compute_continuity_ratio(
 # ── Velocity v3 ───────────────────────────────────────────────────────────────
 
 def compute_velocity(
-    event_timestamps: list[datetime],
-    started_at: Optional[datetime],
-    ended_at: Optional[datetime],
+    event_timestamps_or_start: Any = None,
+    started_at_or_end: Optional[datetime] = None,
+    ended_at: Optional[datetime] = None,
 ) -> int:
     """
     base_velocity from active hours × continuity_ratio.
+    Supports both v3 (event_timestamps, started_at, ended_at) and v1/v2 (started_at, ended_at).
     """
+    if isinstance(event_timestamps_or_start, datetime) and ended_at is None:
+        started_at = event_timestamps_or_start
+        ended_at = started_at_or_end
+        event_timestamps = []
+    elif event_timestamps_or_start is None and ended_at is None and isinstance(started_at_or_end, datetime):
+        started_at = None
+        ended_at = None
+        event_timestamps = []
+    else:
+        event_timestamps = event_timestamps_or_start or []
+        started_at = started_at_or_end
+        ended_at = ended_at
+
     cfg = eas_config.scoring
     active_hours = compute_active_time_hours(event_timestamps, started_at, ended_at)
     if active_hours == 0 and started_at and ended_at:
         active_hours = (ended_at - started_at).total_seconds() / 3600
+
+    if not started_at or not ended_at:
+        return 0
 
     if active_hours < cfg.velocity_fast_hours:
         base = cfg.velocity_fast_bonus
@@ -92,11 +109,26 @@ def compute_velocity(
     if base == 0:
         return 0
 
-    continuity = compute_continuity_ratio(event_timestamps, started_at, ended_at)
+    continuity = compute_continuity_ratio(event_timestamps, started_at, ended_at) if event_timestamps else 1.0
     return max(0, round(base * continuity))
 
 
 # ── AI efficiency v3 ──────────────────────────────────────────────────────────
+
+def compute_ai_penalty(
+    loop_detected: bool = False,
+    loop_severity: float = 0.0,
+    unproductive_prompts: int = 0,
+) -> int:
+    """
+    Legacy and direct AI penalty calculator.
+    """
+    cfg = eas_config.scoring
+    penalty = 0
+    if loop_detected:
+        penalty += max(cfg.loop_base_penalty, int(loop_severity * 15))
+    penalty += unproductive_prompts * 2
+    return min(penalty, cfg.max_loop_penalty)
 
 def compute_ai_efficiency(
     prompt_count: int,
@@ -191,6 +223,13 @@ def compute_score(
     cfg = eas_config.scoring
     ts  = event_timestamps or []
 
+    # If called with legacy 8 positional arguments: compute_score(lvl, s, e, fd, re, ld, ls, unprod)
+    if prompt_count > 0 and output_count == 0 and unproductive_prompts == 0 and not ai_event_timestamps:
+        unproductive_prompts = prompt_count
+        eff_prompt_count = 0
+    else:
+        eff_prompt_count = prompt_count
+
     outcome_score     = level * 10
     velocity          = compute_velocity(ts, started_at, ended_at)
     stability_penalty = compute_stability_penalty(failed_deploy_count, repeated_error_count)
@@ -198,12 +237,11 @@ def compute_score(
     active_hours      = compute_active_time_hours(ts, started_at, ended_at) or \
                         ((ended_at - started_at).total_seconds() / 3600 if started_at and ended_at else 1.0)
 
-    ai_penalty, ai_details = compute_ai_efficiency(prompt_count, output_count, active_hours, ai_event_timestamps)
+    ai_penalty, ai_details = compute_ai_efficiency(eff_prompt_count, output_count, active_hours, ai_event_timestamps)
 
-    # Add loop penalty on top
-    if loop_detected:
-        loop_pts = max(cfg.loop_base_penalty, int(loop_severity * 15))
-        ai_penalty = min(ai_penalty + loop_pts, cfg.max_loop_penalty)
+    # Add legacy unproductive prompts and loop penalty
+    legacy_ai = compute_ai_penalty(loop_detected, loop_severity, unproductive_prompts)
+    ai_penalty = min(max(ai_penalty, legacy_ai), cfg.max_loop_penalty)
 
     raw          = outcome_score + velocity - stability_penalty - ai_penalty
     final_score  = max(0, min(100, raw))
@@ -221,6 +259,7 @@ def compute_score(
             "continuity_ratio": continuity,
             "stability_penalty": stability_penalty,
             "ai_penalty": ai_penalty,
+            "ai_efficiency": ai_details.get("efficiency_ratio", 1.0),
             **ai_details,
             "raw_score": raw,
             "final_score": final_score,

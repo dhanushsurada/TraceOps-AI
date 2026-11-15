@@ -84,7 +84,8 @@ def _commit_quality_score(commit_meta: dict) -> float:
     if len(msg) > 15 and not is_trivial:
         score += 10
 
-    return round(min(1.0, score / 130), 3)
+    max_possible = 130 if diff else 65
+    return round(min(1.0, score / max_possible), 3)
 
 
 def compute_aggregate_commit_quality(commits: list[dict]) -> float:

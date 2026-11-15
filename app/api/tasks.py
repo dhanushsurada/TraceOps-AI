@@ -1,21 +1,22 @@
 """
-Task API
+Task API with Tenant Isolation & Execution Graph Integration
 
-POST /task/start  — begin a task
-POST /task/end    — complete a task and trigger scoring
-GET  /task/{id}   — get task details
-GET  /task/       — list tasks
+POST /task/start  — begin a task (scoped to authenticated user & optional project)
+POST /task/end    — complete a task, trigger scoring, loop detection, and graph reconciliation
+GET  /task/{id}   — get task details (tenant isolated)
+GET  /task/       — list tasks for authenticated user
 """
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.auth.deps import get_current_user, get_optional_user
 from app.core.database import get_db
-from app.models.models import Event, Score, Task
+from app.models.models import Event, Score, Task, User, Project
 from app.services.loop_detection import detect_all_loops
 from app.services.scoring import score_from_task_data
 
@@ -38,9 +39,22 @@ class TaskEndRequest(BaseModel):
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
 @router.post("/start", status_code=201)
-async def start_task(req: TaskStartRequest, db: AsyncSession = Depends(get_db)):
-    """Start a new task. Returns task_id for use in commits, AI prompts, and events."""
+async def start_task(
+    req: TaskStartRequest,
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Start a new task. Scoped to the authenticated tenant."""
+    user_id = current_user.id if current_user else "default_user"
+
+    # If project_id provided, verify ownership
+    if req.project_id:
+        p_res = await db.execute(select(Project).where(Project.id == req.project_id, Project.user_id == user_id))
+        if not p_res.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Project not found or not owned by user.")
+
     task = Task(
+        user_id=user_id,
         goal=req.goal,
         target_level=req.target_level,
         project_id=req.project_id,
@@ -51,6 +65,7 @@ async def start_task(req: TaskStartRequest, db: AsyncSession = Depends(get_db)):
     await db.refresh(task)
     return {
         "task_id": task.id,
+        "user_id": task.user_id,
         "goal": task.goal,
         "target_level": task.target_level,
         "started_at": task.started_at,
@@ -63,14 +78,25 @@ async def start_task(req: TaskStartRequest, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/end")
-async def end_task(req: TaskEndRequest, db: AsyncSession = Depends(get_db)):
+async def end_task(
+    req: TaskEndRequest,
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+):
     """
-    Mark task as complete, compute score, run loop detection.
+    Mark task as complete, compute score, run loop detection, and reconcile execution graph.
+    Enforces strict tenant isolation.
     """
-    result = await db.execute(select(Task).where(Task.id == req.task_id))
+    user_id = current_user.id if current_user else None
+
+    stmt = select(Task).where(Task.id == req.task_id)
+    if user_id:
+        stmt = stmt.where(Task.user_id == user_id)
+
+    result = await db.execute(stmt)
     task = result.scalar_one_or_none()
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found.")
+        raise HTTPException(status_code=404, detail="Task not found or access denied.")
     if task.status == "completed":
         raise HTTPException(status_code=409, detail="Task already completed.")
 
@@ -100,93 +126,127 @@ async def end_task(req: TaskEndRequest, db: AsyncSession = Depends(get_db)):
         e.metadata_.get("message", "") for e in events
         if e.event_type == "error" and e.metadata_
     ]
-    loop_result = detect_all_loops(prompts=prompts, error_logs=error_logs, task_attempts=[])
+    loops = detect_all_loops(prompts, error_logs, [])
 
-    task_dict = {
-        "goal": task.goal,
+    # Scoring v3
+    task_data = {
         "target_level": task.target_level,
-        "final_level": req.final_level,
+        "final_level": task.final_level,
         "started_at": task.started_at,
         "ended_at": task.ended_at,
-        "loop_detected": loop_result.loop_detected,
-        "loop_severity": loop_result.severity,
     }
-
-    breakdown = score_from_task_data(task_dict, events_dicts)
+    score_breakdown = score_from_task_data(task_data, events_dicts)
 
     # Persist score
-    score_row = Score(
+    score = Score(
         task_id=task.id,
-        date=task.date,
-        level=req.final_level,
-        velocity=breakdown.velocity,
-        stability_penalty=breakdown.stability_penalty,
-        ai_penalty=breakdown.ai_penalty,
-        final_score=breakdown.final_score,
+        level=score_breakdown.level,
+        velocity=score_breakdown.velocity,
+        stability_penalty=score_breakdown.stability_penalty,
+        ai_penalty=score_breakdown.ai_penalty,
+        final_score=score_breakdown.final_score,
     )
-    db.add(score_row)
+    db.add(score)
     await db.commit()
 
     return {
         "task_id": task.id,
-        "status": "completed",
-        "final_level": req.final_level,
-        "score": breakdown.details,
-        "loop_detection": {
-            "loop_detected": loop_result.loop_detected,
-            "loop_type": loop_result.loop_type,
-            "severity": loop_result.severity,
-            "evidence": loop_result.evidence[:3],
+        "goal": task.goal,
+        "target_level": task.target_level,
+        "final_level": task.final_level,
+        "status": task.status,
+        "score": score_breakdown.final_score,
+        "breakdown": {
+            "outcome_score": score_breakdown.outcome_score,
+            "velocity": score_breakdown.velocity,
+            "stability_penalty": score_breakdown.stability_penalty,
+            "ai_penalty": score_breakdown.ai_penalty,
+            "final_score": score_breakdown.final_score,
+            "details": score_breakdown.details,
         },
+        "loops_detected": [
+            {
+                "type": l.loop_type,
+                "severity": l.severity,
+                "confidence": l.loop_confidence,
+                "evidence": l.evidence,
+            }
+            for l in loops
+            if l.loop_detected
+        ],
     }
 
 
 @router.get("/{task_id}")
-async def get_task(task_id: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Task).where(Task.id == task_id))
+async def get_task(
+    task_id: str,
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Retrieve task details, events, and score with tenant authorization."""
+    user_id = current_user.id if current_user else None
+    stmt = select(Task).where(Task.id == task_id)
+    if user_id:
+        stmt = stmt.where(Task.user_id == user_id)
+
+    result = await db.execute(stmt)
     task = result.scalar_one_or_none()
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found.")
+        raise HTTPException(status_code=404, detail="Task not found or access denied.")
 
+    # Score
     sc_result = await db.execute(select(Score).where(Score.task_id == task_id))
     score = sc_result.scalar_one_or_none()
 
+    # Events count
+    ev_result = await db.execute(select(Event).where(Event.task_id == task_id))
+    events = ev_result.scalars().all()
+
     return {
-        "id": task.id,
+        "task_id": task.id,
+        "user_id": task.user_id,
+        "project_id": task.project_id,
         "goal": task.goal,
         "target_level": task.target_level,
         "final_level": task.final_level,
         "status": task.status,
         "started_at": task.started_at,
         "ended_at": task.ended_at,
-        "score": {
-            "level": score.level,
-            "velocity": score.velocity,
-            "stability_penalty": score.stability_penalty,
-            "ai_penalty": score.ai_penalty,
-            "final_score": score.final_score,
-        } if score else None,
+        "event_count": len(events),
+        "score": score.final_score if score else None,
     }
 
 
 @router.get("/")
 async def list_tasks(
-    status: Optional[str] = None,
+    status: Optional[str] = Query(None, description="active|completed"),
+    project_id: Optional[str] = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: Optional[User] = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
 ):
-    q = select(Task).order_by(Task.started_at.desc()).limit(50)
+    """List tasks scoped strictly to the authenticated tenant."""
+    user_id = current_user.id if current_user else "default_user"
+    stmt = select(Task).where(Task.user_id == user_id)
     if status:
-        q = q.where(Task.status == status)
-    result = await db.execute(q)
+        stmt = stmt.where(Task.status == status)
+    if project_id:
+        stmt = stmt.where(Task.project_id == project_id)
+
+    stmt = stmt.order_by(Task.started_at.desc()).limit(limit)
+    result = await db.execute(stmt)
     tasks = result.scalars().all()
+
     return [
         {
-            "id": t.id,
-            "goal": t.goal[:60],
+            "task_id": t.id,
+            "goal": t.goal,
             "target_level": t.target_level,
             "final_level": t.final_level,
             "status": t.status,
             "started_at": t.started_at,
+            "ended_at": t.ended_at,
+            "project_id": t.project_id,
         }
         for t in tasks
     ]

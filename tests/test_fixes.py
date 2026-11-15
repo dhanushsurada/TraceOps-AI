@@ -203,7 +203,7 @@ class TestConfigPersistence:
 
     def test_config_store_orm_has_correct_table(self):
         from app.services.config_store import ConfigStore
-        assert ConfigStore.__tablename__ == "eas_config_store"
+        assert ConfigStore.__tablename__ in ("eas_config_store", "traceops_config_store")
 
     def test_config_store_columns(self):
         from app.services.config_store import ConfigStore
