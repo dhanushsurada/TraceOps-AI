@@ -22,10 +22,16 @@ async def get_current_user(
     """Require authenticated user. Raises 401 if not authenticated."""
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
-        # Also check Authorization header for API clients
+        # Check Authorization header (Bearer token)
         auth = request.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
-            token = auth[7:]
+            token = auth[7:].strip()
+        elif auth.startswith("Token "):
+            token = auth[6:].strip()
+
+    if not token:
+        # Check X-API-Key or X-TraceOps-Key headers
+        token = request.headers.get("X-API-Key") or request.headers.get("X-TraceOps-Key")
 
     if not token:
         raise HTTPException(

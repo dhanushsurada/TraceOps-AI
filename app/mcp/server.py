@@ -1,5 +1,5 @@
 """
-TraceOps Model Context Protocol (MCP) Server
+TraceOps Model Context Protocol (MCP) Server with Tenant Authentication
 
 Exposes TraceOps execution intelligence directly to AI tools and agents:
 - Claude Desktop
@@ -8,18 +8,26 @@ Exposes TraceOps execution intelligence directly to AI tools and agents:
 - ChatGPT Custom Actions
 - Autonomous Agent SAM
 
-Implements standard MCP JSON-RPC protocol over stdio and HTTP SSE.
+Mandatory Tenant Isolation: Requires API Key or Bearer Session Token for all tool operations.
 """
 import asyncio
 import json
+import os
 import sys
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import select
 from app.core.database import AsyncSessionLocal
-from app.models.models import Task, Commit, ErrorRecord, Assessment, Observation
+from app.models.models import Task, Commit, ErrorRecord, User, UserSession
+from app.services.auth import get_user_from_session
 from app.services.graph_engine import GraphEngine
 
+AUTH_SCHEMA = {
+    "api_key": {
+        "type": "string",
+        "description": "TraceOps API key or session token for tenant authorization",
+    }
+}
 
 TOOLS = [
     {
@@ -28,9 +36,11 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                **AUTH_SCHEMA,
                 "timeframe": {"type": "string", "description": "e.g. '24h', '7d', '30d'", "default": "7d"},
                 "project_slug": {"type": "string", "description": "Optional repository slug"},
             },
+            "required": ["api_key"],
         },
     },
     {
@@ -39,9 +49,10 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                **AUTH_SCHEMA,
                 "task_id": {"type": "string", "description": "TraceOps Task UUID"},
             },
-            "required": ["task_id"],
+            "required": ["api_key", "task_id"],
         },
     },
     {
@@ -50,9 +61,10 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                **AUTH_SCHEMA,
                 "claim": {"type": "string", "description": "The achievement claim to verify"},
             },
-            "required": ["claim"],
+            "required": ["api_key", "claim"],
         },
     },
     {
@@ -60,20 +72,49 @@ TOOLS = [
         "description": "Returns active execution loops, recurring exceptions, or stalled tasks requiring developer intervention.",
         "inputSchema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                **AUTH_SCHEMA,
+            },
+            "required": ["api_key"],
         },
     },
 ]
 
 
-async def handle_tool_call(name: str, arguments: Dict[str, Any], user_id: str = "default_user") -> Dict[str, Any]:
+async def _resolve_tenant_user(db, api_key: Optional[str]) -> Optional[User]:
+    """Resolve authenticated tenant User from API key or session token."""
+    key = api_key or os.environ.get("TRACEOPS_API_KEY")
+    if not key:
+        return None
+    # 1. Check session token
+    user = await get_user_from_session(db, key)
+    if user:
+        return user
+    # 2. Check direct user ID (for development / local tests)
+    u_res = await db.execute(select(User).where(User.id == key))
+    return u_res.scalar_one_or_none()
+
+
+async def handle_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    api_key = arguments.get("api_key")
+
     async with AsyncSessionLocal() as db:
+        user = await _resolve_tenant_user(db, api_key)
+        if not user:
+            return {
+                "error": "Authentication failed. Provide a valid 'api_key' parameter or set TRACEOPS_API_KEY.",
+                "authenticated": False,
+            }
+
+        user_id = user.id
+
         if name == "get_engineering_audit":
             t_res = await db.execute(select(Task).where(Task.user_id == user_id).limit(20))
             tasks = t_res.scalars().all()
             c_res = await db.execute(select(Commit).where(Commit.user_id == user_id).limit(50))
             commits = c_res.scalars().all()
             return {
+                "tenant_id": user_id,
                 "total_tasks": len(tasks),
                 "completed_tasks": sum(1 for t in tasks if t.status == "completed"),
                 "total_commits": len(commits),
@@ -93,6 +134,7 @@ async def handle_tool_call(name: str, arguments: Dict[str, Any], user_id: str = 
             matches = [c.sha[:7] for c in commits if any(w in c.message.lower() for w in claim_words if len(w) > 3)]
             verified = len(matches) > 0
             return {
+                "tenant_id": user_id,
                 "claim": claim,
                 "verified": verified,
                 "matching_commits": matches,
@@ -103,6 +145,7 @@ async def handle_tool_call(name: str, arguments: Dict[str, Any], user_id: str = 
             err_res = await db.execute(select(ErrorRecord).where(ErrorRecord.user_id == user_id).limit(10))
             errors = err_res.scalars().all()
             return {
+                "tenant_id": user_id,
                 "active_exceptions": len(errors),
                 "exceptions": [{"type": e.exception_type, "msg": e.message[:80]} for e in errors],
             }

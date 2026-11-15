@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.auth.deps import get_optional_user
+from app.api.auth.deps import get_current_user
 from app.core.database import get_db
 from app.models.models import (
     User, Task, Commit, FileChange, Deployment, ErrorRecord,
@@ -36,14 +36,15 @@ class VerifyClaimRequest(BaseModel):
 async def get_engineering_audit(
     timeframe: str = Query("7d", description="e.g. 24h, 7d, 30d"),
     project_id: Optional[str] = Query(None),
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Returns an auditable context package for external AI models (ChatGPT, Claude, SAM).
     Includes verified achievements, assessments, bottlenecks, and evidence coverage.
+    Mandatory authentication: strictly tenant isolated.
     """
-    user_id = current_user.id if current_user else "default_user"
+    user_id = current_user.id
 
     # Parse timeframe
     days = 7
@@ -149,24 +150,24 @@ async def get_engineering_audit(
 @router.get("/task/{task_id}")
 async def get_task_context(
     task_id: str,
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Retrieve complete evidence-backed context package for an individual task."""
-    user_id = current_user.id if current_user else "default_user"
+    user_id = current_user.id
 
     t_res = await db.execute(select(Task).where(Task.id == task_id, Task.user_id == user_id))
     task = t_res.scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found or access denied.")
 
-    c_res = await db.execute(select(Commit).where(Commit.task_id == task_id))
+    c_res = await db.execute(select(Commit).where(Commit.task_id == task_id, Commit.user_id == user_id))
     commits = c_res.scalars().all()
 
-    obs_res = await db.execute(select(Observation).where(Observation.task_id == task_id))
+    obs_res = await db.execute(select(Observation).where(Observation.task_id == task_id, Observation.user_id == user_id))
     observations = obs_res.scalars().all()
 
-    ass_res = await db.execute(select(Assessment).where(Assessment.task_id == task_id))
+    ass_res = await db.execute(select(Assessment).where(Assessment.task_id == task_id, Assessment.user_id == user_id))
     assessments = ass_res.scalars().all()
 
     return {
@@ -197,14 +198,14 @@ async def get_task_context(
 @router.post("/verify")
 async def verify_achievement_claim(
     req: VerifyClaimRequest,
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Validates a natural language developer achievement claim against code commits and file changes.
     Returns verification verdict, confidence, and cryptographic citation tag.
     """
-    user_id = current_user.id if current_user else "default_user"
+    user_id = current_user.id
 
     c_res = await db.execute(
         select(Commit).where(Commit.user_id == user_id).order_by(Commit.committed_at.desc()).limit(50)

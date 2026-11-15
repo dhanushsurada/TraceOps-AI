@@ -57,7 +57,7 @@ class TestScheduler:
     def test_worker_health_returns_dict(self):
         import asyncio
         from app.api.scheduler import check_worker_alive
-        result = asyncio.get_event_loop().run_until_complete(check_worker_alive(timeout=0.1))
+        result = asyncio.run(check_worker_alive(timeout=0.1))
         # Will fail (no broker in test) but must return valid dict
         assert "alive" in result
         assert "error" in result
@@ -66,7 +66,7 @@ class TestScheduler:
     def test_db_health_check_structure(self):
         import asyncio
         from app.api.scheduler import check_db_alive
-        result = asyncio.get_event_loop().run_until_complete(check_db_alive())
+        result = asyncio.run(check_db_alive())
         assert "alive" in result
         assert "error" in result
 

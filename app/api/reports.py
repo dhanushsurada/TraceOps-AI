@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.auth.deps import get_current_user, get_optional_user
+from app.api.auth.deps import get_current_user
 from app.core.database import get_db
 from app.models.models import Event, Report, Score, Task, User
 from app.services.deployment import validate_deployment
@@ -56,7 +56,7 @@ async def _generate_report_for_date(target_date: dt_date, user_id: str, db: Asyn
 
     # Fetch events for user's tasks
     ev_result = await db.execute(
-        select(Event).where(Event.task_id.in_(task_ids))
+        select(Event).where(Event.task_id.in_(task_ids), Event.user_id == user_id)
     )
     all_events = ev_result.scalars().all()
 
@@ -175,12 +175,12 @@ async def _generate_report_for_date(target_date: dt_date, user_id: str, db: Asyn
 
 @router.get("/daily")
 async def get_daily_report(
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Return today's report from DB for authenticated user, or generate if missing."""
     today = dt_date.today()
-    user_id = current_user.id if current_user else "default_user"
+    user_id = current_user.id
 
     result = await db.execute(
         select(Report)
@@ -202,21 +202,20 @@ async def get_daily_report(
 
 @router.get("/daily/markdown")
 async def get_daily_report_markdown(
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Return today's report as a Markdown string."""
     from fastapi.responses import PlainTextResponse
     today = dt_date.today()
-    user_id = current_user.id if current_user else "default_user"
-    content = await _generate_report_for_date(today, user_id, db)
+    content = await _generate_report_for_date(today, current_user.id, db)
     return PlainTextResponse(report_to_markdown(content), media_type="text/markdown")
 
 
 @router.get("/{report_date}")
 async def get_report_by_date(
     report_date: str,
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -224,10 +223,9 @@ async def get_report_by_date(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
-    user_id = current_user.id if current_user else "default_user"
     result = await db.execute(
         select(Report)
-        .where(Report.report_date == d, Report.user_id == user_id)
+        .where(Report.report_date == d, Report.user_id == current_user.id)
         .order_by(Report.created_at.desc())
         .limit(1)
     )
@@ -239,14 +237,13 @@ async def get_report_by_date(
 
 @router.post("/generate", status_code=201)
 async def force_generate_report(
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Force-generate and store today's report for current user."""
     today = dt_date.today()
-    user_id = current_user.id if current_user else "default_user"
-    content = await _generate_report_for_date(today, user_id, db)
-    report_row = Report(user_id=user_id, report_date=today, content=content)
+    content = await _generate_report_for_date(today, current_user.id, db)
+    report_row = Report(user_id=current_user.id, report_date=today, content=content)
     db.add(report_row)
     await db.commit()
     return {"message": "Report generated.", "date": today.isoformat(), "report": content}

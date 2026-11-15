@@ -2,21 +2,21 @@
 Comprehensive End-to-End Test Suite for TraceOps Core Platform Features
 
 Tests:
-1. Tenant Isolation & Authorization (User A vs User B)
-2. Execution Graph Multi-Signal Correlation & Traversal
-3. Deterministic Observation Engine & Evidence Hashes
-4. Versioned Assessment Engine (v4.0.0)
-5. External AI Context & Verification Interface
-6. Evidence-Backed Content Generator (LinkedIn & Resume)
-7. Credential Encryption & Decryption (Fernet Envelope)
-8. MCP Server Tools Dispatch
+1. Credential Encryption, Versioned Envelopes (v1:), Key Rotation & Strict Error Handling
+2. Deterministic Observation Engine & Evidence Hashes
+3. Execution Graph Multi-Signal Correlation & Traversal
+4. Versioned Assessment Engine (v4.0.0) with Telemetry-Grounded Scoring
+5. Evidence-Backed Content Generator (Grounded Claims Only)
+6. MCP Server Tools Dispatch & Tenant Authorization
 """
 import pytest
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
+from cryptography.fernet import Fernet
 
+from app.core.config import settings
 from app.models.models import User, Task, Commit, Event, GraphEdge, Project, Observation, Assessment
-from app.services.crypto import encrypt_secret, decrypt_secret
+from app.services.crypto import encrypt_secret, decrypt_secret, rotate_secret, DecryptionError
 from app.services.graph_engine import GraphEngine
 from app.services.observation_engine import ObservationEngine, compute_evidence_hash
 from app.services.assessment_engine import AssessmentEngine
@@ -29,6 +29,7 @@ class TestCredentialEncryption:
         secret = "ghp_super_secret_github_access_token_12345"
         cipher = encrypt_secret(secret)
         assert cipher != secret
+        assert cipher.startswith("v1:")
         assert len(cipher) > len(secret)
         decrypted = decrypt_secret(cipher)
         assert decrypted == secret
@@ -37,6 +38,40 @@ class TestCredentialEncryption:
         assert encrypt_secret(None) is None
         assert decrypt_secret(None) is None
         assert encrypt_secret("") == ""
+        assert decrypt_secret("") == ""
+
+    def test_corrupt_ciphertext_raises_decryption_error(self):
+        with pytest.raises(DecryptionError):
+            decrypt_secret("v1:totally_corrupted_ciphertext_that_cannot_be_decrypted")
+
+    def test_legacy_plaintext_token_passthrough(self):
+        legacy = "ghp_legacy_personal_access_token_1234"
+        assert decrypt_secret(legacy) == legacy
+
+    def test_key_rotation_and_multikey(self):
+        old_key = Fernet.generate_key().decode()
+        new_key = Fernet.generate_key().decode()
+
+        # Encrypt with old_key
+        with patch.object(settings, "ENCRYPTION_KEY", old_key), \
+             patch.object(settings, "PREVIOUS_ENCRYPTION_KEYS", None):
+            cipher_old = encrypt_secret("database_password_999")
+            assert cipher_old.startswith("v1:")
+
+        # Decrypt with new_key as primary and old_key in PREVIOUS_ENCRYPTION_KEYS
+        with patch.object(settings, "ENCRYPTION_KEY", new_key), \
+             patch.object(settings, "PREVIOUS_ENCRYPTION_KEYS", old_key):
+            decrypted = decrypt_secret(cipher_old)
+            assert decrypted == "database_password_999"
+
+            # Re-encrypt (rotate) to new_key
+            rotated = rotate_secret(cipher_old)
+            assert rotated != cipher_old
+
+        # Verify rotated ciphertext decrypts with new_key alone
+        with patch.object(settings, "ENCRYPTION_KEY", new_key), \
+             patch.object(settings, "PREVIOUS_ENCRYPTION_KEYS", None):
+            assert decrypt_secret(rotated) == "database_password_999"
 
 
 class TestEvidenceHash:
@@ -52,6 +87,7 @@ class TestEvidenceHash:
 @pytest.mark.asyncio
 async def test_graph_and_correlation_logic():
     db = AsyncMock()
+    db.add = MagicMock()
     engine = GraphEngine(db)
     user_id = "usr_alice"
     commit_id = "cm_001"
@@ -88,6 +124,7 @@ async def test_graph_and_correlation_logic():
 @pytest.mark.asyncio
 async def test_assessment_engine_v4():
     db = AsyncMock()
+    db.add = MagicMock()
     engine = AssessmentEngine(db)
     user_id = "usr_bob"
     task_id = "tsk_99"
@@ -139,7 +176,7 @@ async def test_assessment_engine_v4():
     assessments = await engine.generate_task_assessments(user_id=user_id, task_id=task_id)
 
     assert len(assessments) == 5
-    dims = {a.assessment_dimension for a in assessments}
+    dims = {a.assessment_dimension: a for a in assessments}
     assert "delivery_velocity" in dims
     assert "execution_efficiency" in dims
     assert "stability_and_reliability" in dims
@@ -151,9 +188,19 @@ async def test_assessment_engine_v4():
         assert 0.0 <= a.score <= 100.0
         assert 0.0 <= a.confidence <= 1.0
 
+    # Test telemetry-grounded validation:
+    # 1. Zero AI prompts should result in score 0.0 with "no_ai_interactions_detected", not 100.0
+    ai_dim = dims["ai_leverage_effectiveness"]
+    assert ai_dim.score == 0.0
+    assert ai_dim.breakdown.get("status") == "no_ai_interactions_detected"
+
+    # 2. Evidence confidence without IDE telemetry should be capped at 0.75
+    conf_dim = dims["evidence_confidence_score"]
+    assert conf_dim.score <= 75.0
+
 
 @pytest.mark.asyncio
-async def test_content_generator_linkedin():
+async def test_content_generator_grounded_claims():
     db = AsyncMock()
     user_id = "usr_carol"
     task = Task(
@@ -191,8 +238,71 @@ async def test_content_generator_linkedin():
     result = await generator.generate_linkedin_update(user_id=user_id, days=7)
 
     assert "post_body" in result
+    post_body = result["post_body"]
     assert "[TRO-EVID-" in result["citation_tag"]
     assert result["tasks_substantiated"] == 1
     assert result["commits_substantiated"] == 1
     assert result["lines_added"] == 150
-    assert "Implement deterministic observations" in result["post_body"]
+    assert "Implement deterministic observations" in post_body
+
+    # Verification: Must strictly adhere to "Evidence before claims"
+    # Never claim unmeasured properties like "100% test coverage" or "reviewed"
+    assert "100% test coverage" not in post_body
+    assert "reviewed" not in post_body.lower()
+
+
+@pytest.mark.asyncio
+async def test_mcp_server_tenant_isolation():
+    # 1. Calling tool without api_key fails authorization
+    resp_unauth = await handle_tool_call("get_engineering_audit", {})
+    assert resp_unauth.get("authenticated") is False
+    assert "Authentication failed" in resp_unauth.get("error", "")
+
+    # 2. Calling with invalid api_key fails authorization
+    with patch("app.mcp.server.AsyncSessionLocal") as mock_session:
+        db_mock = AsyncMock()
+        mock_session.return_value.__aenter__.return_value = db_mock
+
+        # User lookup returns None
+        mock_res = MagicMock()
+        mock_res.scalar_one_or_none.return_value = None
+        db_mock.execute.return_value = mock_res
+
+        resp_invalid = await handle_tool_call("get_engineering_audit", {"api_key": "invalid_key"})
+        assert resp_invalid.get("authenticated") is False
+
+    # 3. Calling with valid tenant credentials resolves scoped tenant data
+    with patch("app.mcp.server.AsyncSessionLocal") as mock_session:
+        db_mock = AsyncMock()
+        mock_session.return_value.__aenter__.return_value = db_mock
+
+        test_user = User(id="usr_alice", email="alice@example.com", name="Alice")
+        
+        # 1. UserSession lookup returns None
+        mock_session_res = MagicMock()
+        mock_session_res.scalar_one_or_none.return_value = None
+
+        # 2. User lookup by ID returns test_user
+        mock_user_res = MagicMock()
+        mock_user_res.scalar_one_or_none.return_value = test_user
+
+        # 3. Tasks lookup
+        mock_tasks_res = MagicMock()
+        mock_tasks_res.scalars.return_value.all.return_value = [
+            Task(id="t1", user_id="usr_alice", goal="Isolation test", status="completed")
+        ]
+
+        # 4. Commits lookup
+        mock_commits_res = MagicMock()
+        mock_commits_res.scalars.return_value.all.return_value = [
+            Commit(id="c1", user_id="usr_alice", sha="abc1234", message="feat: isolation")
+        ]
+
+        # Sequence of execute calls: UserSession -> User -> Tasks -> Commits
+        db_mock.execute.side_effect = [mock_session_res, mock_user_res, mock_tasks_res, mock_commits_res]
+
+        resp_auth = await handle_tool_call("get_engineering_audit", {"api_key": "usr_alice"})
+        assert resp_auth.get("tenant_id") == "usr_alice"
+        assert resp_auth.get("total_tasks") == 1
+        assert resp_auth.get("completed_tasks") == 1
+        assert resp_auth.get("total_commits") == 1

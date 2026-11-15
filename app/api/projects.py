@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.auth.deps import get_optional_user
+from app.api.auth.deps import get_current_user
 from app.core.database import get_db
 from app.models.models import Project, Task, Commit, User
 
@@ -31,10 +31,10 @@ class CreateProjectRequest(BaseModel):
 
 @router.get("/")
 async def list_projects(
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    user_id = current_user.id if current_user else "default_user"
+    user_id = current_user.id
     result = await db.execute(select(Project).where(Project.user_id == user_id).order_by(Project.name.asc()))
     projects = result.scalars().all()
     return [
@@ -55,10 +55,10 @@ async def list_projects(
 @router.post("/", status_code=201)
 async def create_project(
     req: CreateProjectRequest,
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    user_id = current_user.id if current_user else "default_user"
+    user_id = current_user.id
 
     # Check unique slug per user
     existing = await db.execute(
@@ -91,16 +91,16 @@ async def create_project(
 @router.get("/{project_id}")
 async def get_project(
     project_id: str,
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    user_id = current_user.id if current_user else "default_user"
+    user_id = current_user.id
     result = await db.execute(
         select(Project).where(Project.id == project_id, Project.user_id == user_id)
     )
     project = result.scalar_one_or_none()
     if not project:
-        raise HTTPException(status_code=404, detail="Project not found.")
+        raise HTTPException(status_code=404, detail="Project not found or access denied.")
 
     # Count tasks and commits
     tasks_res = await db.execute(select(Task).where(Task.project_id == project_id))

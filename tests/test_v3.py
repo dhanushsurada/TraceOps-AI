@@ -374,8 +374,6 @@ class TestMetricsSafety:
         import app.api.metrics as m
         old = m._manual_scores[:]
         m._manual_scores.clear()
-        result = asyncio.get_event_loop().run_until_complete(
-            run_adaptive_tuning(TuningRequest(force=False))
-        )
+        result = asyncio.run(run_adaptive_tuning(TuningRequest(force=False)))
         assert result["tuned"] is False
         m._manual_scores.extend(old)

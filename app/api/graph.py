@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.auth.deps import get_optional_user
+from app.api.auth.deps import get_current_user
 from app.core.database import get_db
 from app.models.models import User, Task, Project, GraphEdge
 from app.services.graph_engine import GraphEngine
@@ -34,13 +34,12 @@ class CreateEdgeRequest(BaseModel):
 @router.get("/task/{task_id}")
 async def get_task_graph(
     task_id: str,
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Retrieve full execution DAG and timeline for a task."""
-    user_id = current_user.id if current_user else "default_user"
+    """Retrieve full execution DAG and timeline for a task (strictly tenant isolated)."""
     engine = GraphEngine(db)
-    graph = await engine.get_task_graph(user_id=user_id, task_id=task_id)
+    graph = await engine.get_task_graph(user_id=current_user.id, task_id=task_id)
     if "error" in graph:
         raise HTTPException(status_code=404, detail="Task not found or access denied.")
     return graph
@@ -49,14 +48,13 @@ async def get_task_graph(
 @router.post("/edge", status_code=201)
 async def create_graph_edge(
     req: CreateEdgeRequest,
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Add a verified causal or associative edge between engineering artifacts."""
-    user_id = current_user.id if current_user else "default_user"
     engine = GraphEngine(db)
     edge = await engine.add_edge(
-        user_id=user_id,
+        user_id=current_user.id,
         source_type=req.source_type,
         source_id=req.source_id,
         edge_type=req.edge_type,

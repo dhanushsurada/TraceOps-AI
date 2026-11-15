@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.auth.deps import get_current_user, get_optional_user
+from app.api.auth.deps import get_current_user
 from app.core.database import get_db
 from app.models.models import Event, Score, Task, User, Project
 from app.services.loop_detection import detect_all_loops
@@ -41,17 +41,17 @@ class TaskEndRequest(BaseModel):
 @router.post("/start", status_code=201)
 async def start_task(
     req: TaskStartRequest,
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Start a new task. Scoped to the authenticated tenant."""
-    user_id = current_user.id if current_user else "default_user"
+    """Start a new task. Mandatory authentication scoped to the current user."""
+    user_id = current_user.id
 
     # If project_id provided, verify ownership
     if req.project_id:
         p_res = await db.execute(select(Project).where(Project.id == req.project_id, Project.user_id == user_id))
         if not p_res.scalar_one_or_none():
-            raise HTTPException(status_code=404, detail="Project not found or not owned by user.")
+            raise HTTPException(status_code=404, detail="Project not found or access denied.")
 
     task = Task(
         user_id=user_id,
@@ -80,20 +80,14 @@ async def start_task(
 @router.post("/end")
 async def end_task(
     req: TaskEndRequest,
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Mark task as complete, compute score, run loop detection, and reconcile execution graph.
-    Enforces strict tenant isolation.
+    Mark task as complete, compute score, run loop detection.
+    Strictly enforces task ownership: User A cannot complete User B's task.
     """
-    user_id = current_user.id if current_user else None
-
-    stmt = select(Task).where(Task.id == req.task_id)
-    if user_id:
-        stmt = stmt.where(Task.user_id == user_id)
-
-    result = await db.execute(stmt)
+    result = await db.execute(select(Task).where(Task.id == req.task_id, Task.user_id == current_user.id))
     task = result.scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found or access denied.")
@@ -126,7 +120,7 @@ async def end_task(
         e.metadata_.get("message", "") for e in events
         if e.event_type == "error" and e.metadata_
     ]
-    loops = detect_all_loops(prompts, error_logs, [])
+    loop_res = detect_all_loops(prompts, error_logs, [])
 
     # Scoring v3
     task_data = {
@@ -166,30 +160,23 @@ async def end_task(
         },
         "loops_detected": [
             {
-                "type": l.loop_type,
-                "severity": l.severity,
-                "confidence": l.loop_confidence,
-                "evidence": l.evidence,
+                "type": loop_res.loop_type,
+                "severity": loop_res.severity,
+                "confidence": loop_res.loop_confidence,
+                "evidence": loop_res.evidence,
             }
-            for l in loops
-            if l.loop_detected
-        ],
+        ] if loop_res.loop_detected else [],
     }
 
 
 @router.get("/{task_id}")
 async def get_task(
     task_id: str,
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Retrieve task details, events, and score with tenant authorization."""
-    user_id = current_user.id if current_user else None
-    stmt = select(Task).where(Task.id == task_id)
-    if user_id:
-        stmt = stmt.where(Task.user_id == user_id)
-
-    result = await db.execute(stmt)
+    """Retrieve task details, events, and score with strict tenant authorization."""
+    result = await db.execute(select(Task).where(Task.id == task_id, Task.user_id == current_user.id))
     task = result.scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found or access denied.")
@@ -222,12 +209,11 @@ async def list_tasks(
     status: Optional[str] = Query(None, description="active|completed"),
     project_id: Optional[str] = Query(None),
     limit: int = Query(20, ge=1, le=100),
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """List tasks scoped strictly to the authenticated tenant."""
-    user_id = current_user.id if current_user else "default_user"
-    stmt = select(Task).where(Task.user_id == user_id)
+    stmt = select(Task).where(Task.user_id == current_user.id)
     if status:
         stmt = stmt.where(Task.status == status)
     if project_id:

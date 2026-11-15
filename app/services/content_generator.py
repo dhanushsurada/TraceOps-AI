@@ -5,9 +5,11 @@ Generates human-readable, defensible engineering artifacts:
 - LinkedIn progress posts
 - Resume achievement bullets
 - Technical changelogs and release notes
-- Case studies
 
-Every statement includes cryptographic evidence citations (`[TRO-EVID-<hash>]`).
+Core Rule: Evidence before claims.
+Never assert facts that cannot be substantiated from recorded telemetry.
+Omit unmeasured properties (e.g. test coverage percentage, code reviews) unless
+corroborated by actual database records.
 """
 import hashlib
 from datetime import datetime, timedelta
@@ -16,7 +18,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.models import Task, Commit, Assessment, Observation, Project
+from app.models.models import Task, Commit, Assessment, Observation, Project, Event
 
 
 class ContentGenerator:
@@ -24,7 +26,7 @@ class ContentGenerator:
         self.db = db
 
     async def generate_linkedin_update(self, user_id: str, days: int = 7) -> Dict[str, Any]:
-        """Produce an evidence-backed LinkedIn post with citations."""
+        """Produce an evidence-backed LinkedIn post with citations derived strictly from verified data."""
         start_date = datetime.utcnow() - timedelta(days=days)
 
         # Fetch completed tasks
@@ -43,35 +45,36 @@ class ContentGenerator:
         )
         commits = c_res.scalars().all()
 
-        # Fetch assessments
-        a_res = await self.db.execute(
-            select(Assessment).where(Assessment.user_id == user_id, Assessment.created_at >= start_date)
-        )
-        assessments = a_res.scalars().all()
-
         task_count = len(tasks)
         commit_count = len(commits)
         loc_added = sum(c.lines_added for c in commits)
+        loc_deleted = sum(c.lines_deleted for c in commits)
 
-        evidence_str = f"usr_{user_id[:6]}_{task_count}t_{commit_count}c"
+        evidence_str = f"usr_{user_id[:6]}_{task_count}t_{commit_count}c_{loc_added}l"
         citation_hash = hashlib.sha256(evidence_str.encode()).hexdigest()[:8].upper()
         citation_tag = f"[TRO-EVID-{citation_hash}]"
 
-        task_bullets = "\n".join(f"• Completed: {t.goal}" for t in tasks[:4]) if tasks else "• Conducted deep architecture design and testing"
+        task_bullets = "\n".join(f"• Completed: {t.goal}" for t in tasks[:4]) if tasks else "• Progress recorded across active development branches"
 
-        post_body = f"""🚀 Engineering Execution Update ({days}-Day Sprint)
+        # Evidence-grounded telemetry points
+        telemetry_lines = [
+            f"⚡ {commit_count} Git commits recorded across {task_count} completed tasks",
+        ]
+        if loc_added > 0:
+            telemetry_lines.append(f"📦 +{loc_added} / -{loc_deleted} lines of code modified")
 
-Over the past week, I focused on high-impact software execution:
+        telemetry_block = "\n".join(telemetry_lines)
+
+        post_body = f"""Engineering Execution Summary ({days}-Day Period)
+
+Development Milestones:
 {task_bullets}
 
-Key Engineering Telemetry:
-⚡ {commit_count} verified Git commits pushed across {task_count} focused tasks
-📦 {loc_added} lines of code written and reviewed
-🔒 100% test coverage with automated durability & tenant isolation
+Telemetry Recorded:
+{telemetry_block}
 
-Evidence-backed progress verified by TraceOps Execution Intelligence {citation_tag}
-
-#SoftwareEngineering #BuildInPublic #DevOps #AI #TraceOps"""
+Traceability Reference: {citation_tag}
+Verified by TraceOps Execution Intelligence."""
 
         return {
             "post_body": post_body,
@@ -79,6 +82,7 @@ Evidence-backed progress verified by TraceOps Execution Intelligence {citation_t
             "tasks_substantiated": task_count,
             "commits_substantiated": commit_count,
             "lines_added": loc_added,
+            "lines_deleted": loc_deleted,
         }
 
     async def generate_resume_bullet(self, user_id: str, task_id: str) -> Dict[str, Any]:
@@ -88,15 +92,21 @@ Evidence-backed progress verified by TraceOps Execution Intelligence {citation_t
         if not task:
             return {"error": "Task not found"}
 
-        c_res = await db.execute(select(Commit).where(Commit.task_id == task_id)) if 'db' in locals() else await self.db.execute(select(Commit).where(Commit.task_id == task_id))
+        c_res = await self.db.execute(select(Commit).where(Commit.task_id == task_id, Commit.user_id == user_id))
         commits = c_res.scalars().all()
 
+        loc_added = sum(c.lines_added for c in commits)
         citation_tag = f"[TRO-EVID-{task.id[:8].upper()}]"
-        bullet = f"Architected and deployed {task.goal}, delivering {len(commits)} production commits with zero regressions {citation_tag}."
+
+        if loc_added > 0:
+            bullet = f"Delivered {task.goal}, implementing {len(commits)} commits (+{loc_added} LOC) {citation_tag}."
+        else:
+            bullet = f"Completed {task.goal}, delivering {len(commits)} verified commits {citation_tag}."
 
         return {
             "task_id": task_id,
             "resume_bullet": bullet,
             "citation_tag": citation_tag,
             "commit_count": len(commits),
+            "lines_added": loc_added,
         }

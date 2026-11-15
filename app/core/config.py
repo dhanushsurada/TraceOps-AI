@@ -42,8 +42,12 @@ class Settings(BaseSettings):
     FRONTEND_URL: str = "https://traceops-ai.onrender.com"
     SESSION_EXPIRE_DAYS: int = 30
 
-    # Integration webhooks (optional)
+    # Integration webhooks
     GITHUB_WEBHOOK_SECRET: str = ""
+
+    # Encryption & Key Management
+    ENCRYPTION_KEY: str = ""                     # Primary 32-byte urlsafe base64 Fernet key
+    PREVIOUS_ENCRYPTION_KEYS: str = ""          # Comma-separated previous keys for rotation
 
 
 settings = Settings()
