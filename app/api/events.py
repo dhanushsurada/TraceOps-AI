@@ -92,18 +92,20 @@ async def ingest_github_webhook(
     db: AsyncSession = Depends(get_db),
     x_github_event: Optional[str] = Header(None, alias="X-GitHub-Event"),
     x_hub_signature_256: Optional[str] = Header(None, alias="X-Hub-Signature-256"),
+    x_traceops_tenant_id: Optional[str] = Header(None, alias="X-TraceOps-Tenant-ID"),
 ):
     """
-    Receive GitHub push webhook with mandatory HMAC-SHA256 signature validation.
-    Bypassing verification without signature is strictly blocked.
+    Receive GitHub push webhook with mandatory HMAC-SHA256 signature validation and deterministic tenant mapping.
+    - Dedicated Secret: GITHUB_WEBHOOK_SECRET is mandatory; fallback to SECRET_KEY is forbidden.
+    - Deterministic Mapping: Resolves to exactly one verified tenant; collisions/ambiguity are rejected.
     """
     body_bytes = await request.body()
-    webhook_secret = settings.GITHUB_WEBHOOK_SECRET or settings.SECRET_KEY
+    webhook_secret = settings.GITHUB_WEBHOOK_SECRET
 
-    if not webhook_secret:
+    if not webhook_secret or not webhook_secret.strip():
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Server configuration error: GITHUB_WEBHOOK_SECRET is required.",
+            detail="Server configuration error: GITHUB_WEBHOOK_SECRET is mandatory for webhook ingestion. Falling back to SECRET_KEY is forbidden.",
         )
 
     if not x_hub_signature_256:
@@ -125,22 +127,56 @@ async def ingest_github_webhook(
     if event_type not in ("push", "pull_request"):
         return {"skipped": True, "reason": f"Unhandled event type: {event_type}"}
 
-    # Map webhook to project / tenant
     repo_slug = payload.get("repository", {}).get("full_name")
-    user_id = None
-    if repo_slug:
-        proj_res = await db.execute(select(Project).where(Project.slug == repo_slug))
-        project = proj_res.scalar_one_or_none()
-        if project:
-            user_id = project.user_id
+    if not repo_slug:
+        return {"skipped": True, "reason": "No repository.full_name in payload"}
 
-    if not user_id:
-        sender_login = payload.get("sender", {}).get("login")
-        if sender_login:
-            u_res = await db.execute(select(User).where(User.github_username == sender_login))
-            u = u_res.scalar_one_or_none()
-            if u:
-                user_id = u.id
+    # Deterministic Tenant Mapping Policy
+    user_id: Optional[str] = None
+    proj_stmt = select(Project).where(Project.slug == repo_slug)
+    matching_projects = (await db.execute(proj_stmt)).scalars().all()
+
+    if x_traceops_tenant_id:
+        # Explicit tenant specified in webhook header
+        tenant_match = [p for p in matching_projects if p.user_id == x_traceops_tenant_id]
+        if tenant_match:
+            user_id = tenant_match[0].user_id
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Specified tenant '{x_traceops_tenant_id}' does not own registered repository '{repo_slug}'.",
+            )
+    elif len(matching_projects) == 1:
+        # Unambiguous single project registered
+        user_id = matching_projects[0].user_id
+    elif len(matching_projects) > 1:
+        # Collision: multiple tenants registered the same repo slug.
+        # Disambiguate strictly via verified sender identity
+        sender_gh_id = str(payload.get("sender", {}).get("id", ""))
+        sender_login = payload.get("sender", {}).get("login", "")
+        candidate_user_ids = {p.user_id for p in matching_projects}
+
+        u_stmt = select(User).where(
+            User.id.in_(candidate_user_ids),
+            (User.github_id == sender_gh_id) | (User.github_username == sender_login)
+        )
+        resolved_users = (await db.execute(u_stmt)).scalars().all()
+
+        if len(resolved_users) == 1:
+            user_id = resolved_users[0].id
+        else:
+            # Cannot be deterministically disambiguated — reject to prevent cross-tenant pollution
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Ambiguous tenant mapping for repository '{repo_slug}'. Multiple tenants match. Disambiguate via X-TraceOps-Tenant-ID header.",
+            )
+    else:
+        # No project registered; check for unambiguous registered user by github_id
+        sender_gh_id = str(payload.get("sender", {}).get("id", ""))
+        if sender_gh_id:
+            users = (await db.execute(select(User).where(User.github_id == sender_gh_id))).scalars().all()
+            if len(users) == 1:
+                user_id = users[0].id
 
     if not user_id:
         return {"skipped": True, "reason": f"No registered TraceOps tenant found for repository '{repo_slug}'."}
@@ -161,12 +197,12 @@ async def ingest_github_webhook(
             created_ids.append(event.id)
 
         if webhook_row:
-            await mark_processed(webhook_row.id, db)
+            await mark_processed(db, webhook_row.id)
 
         return {"created": len(created_ids), "event_ids": created_ids}
     except Exception as e:
         if webhook_row:
-            await mark_failed(webhook_row.id, str(e), db)
+            await mark_failed(db, webhook_row.id, str(e))
         raise
 
 

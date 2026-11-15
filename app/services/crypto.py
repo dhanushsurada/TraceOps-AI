@@ -32,35 +32,30 @@ class DecryptionError(CryptoError):
     pass
 
 
-def _derive_fallback_key(secret: str) -> bytes:
-    """Derives a deterministic 32-byte urlsafe base64 key using SHA-256 with a domain-specific salt."""
-    salt = b"traceops-credentials-fernet-v1-salt"
-    key_material = hashlib.sha256(secret.encode() + salt).digest()
-    return base64.urlsafe_b64encode(key_material)
-
-
 def _get_active_fernets() -> MultiFernet:
     """
     Construct MultiFernet instance using primary key and any configured rotation keys.
     Primary key is always first (used for encryption).
+    Raises CryptoError if no valid ENCRYPTION_KEY is configured. Never falls back to SECRET_KEY.
     """
     keys: List[bytes] = []
 
-    # 1. Primary key
-    if settings.ENCRYPTION_KEY:
+    # 1. Primary key - dedicated independent Fernet key
+    if settings.ENCRYPTION_KEY and settings.ENCRYPTION_KEY.strip():
         try:
             k = settings.ENCRYPTION_KEY.encode().strip()
-            # Validate key length/format
             Fernet(k)
             keys.append(k)
         except Exception as e:
-            log.error(f"Configured ENCRYPTION_KEY is invalid: {e}. Falling back to derived key.")
-
-    if not keys:
-        keys.append(_derive_fallback_key(settings.SECRET_KEY))
+            raise CryptoError(f"Configured ENCRYPTION_KEY is invalid: {e}")
+    else:
+        raise CryptoError(
+            "ENCRYPTION_KEY is not configured. A separately managed 32-byte Fernet key is required. "
+            "Silent fallback to SECRET_KEY is forbidden."
+        )
 
     # 2. Previous keys for seamless rotation
-    if settings.PREVIOUS_ENCRYPTION_KEYS:
+    if settings.PREVIOUS_ENCRYPTION_KEYS and settings.PREVIOUS_ENCRYPTION_KEYS.strip():
         for prev in settings.PREVIOUS_ENCRYPTION_KEYS.split(","):
             prev_clean = prev.strip().encode()
             if prev_clean:
@@ -68,7 +63,7 @@ def _get_active_fernets() -> MultiFernet:
                     Fernet(prev_clean)
                     keys.append(prev_clean)
                 except Exception as e:
-                    log.warning(f"Ignored invalid rotation key in PREVIOUS_ENCRYPTION_KEYS: {e}")
+                    raise CryptoError(f"Invalid rotation key in PREVIOUS_ENCRYPTION_KEYS: {e}")
 
     fernet_instances = [Fernet(k) for k in keys]
     return MultiFernet(fernet_instances)

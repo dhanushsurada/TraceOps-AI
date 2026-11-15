@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.models.models import User
-from app.services.auth import get_user_from_session
+from app.services.auth import get_user_from_session, verify_api_key
 
 SESSION_COOKIE = "traceops_session"
 
@@ -39,11 +39,16 @@ async def get_current_user(
             detail="Not authenticated. Please sign in at /auth/login",
         )
 
-    user = await get_user_from_session(db, token)
+    user = None
+    if token.startswith("tro_"):
+        user = await verify_api_key(db, token)
+    else:
+        user = await get_user_from_session(db, token)
+
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Session expired or invalid. Please sign in again.",
+            detail="Session or API key expired or invalid. Please authenticate.",
         )
     return user
 

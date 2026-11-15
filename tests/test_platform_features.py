@@ -3,20 +3,21 @@ Comprehensive End-to-End Test Suite for TraceOps Core Platform Features
 
 Tests:
 1. Credential Encryption, Versioned Envelopes (v1:), Key Rotation & Strict Error Handling
-2. Deterministic Observation Engine & Evidence Hashes
-3. Execution Graph Multi-Signal Correlation & Traversal
-4. Versioned Assessment Engine (v4.0.0) with Telemetry-Grounded Scoring
-5. Evidence-Backed Content Generator (Grounded Claims Only)
-6. MCP Server Tools Dispatch & Tenant Authorization
+2. Production Startup Validation (Mandatory Independent Keys, No Insecure Defaults)
+3. Deterministic Observation Engine & Evidence Hashes
+4. Execution Graph Multi-Signal Correlation & Traversal
+5. Versioned Assessment Engine (v4.0.0) with Telemetry-Grounded Scoring
+6. Evidence-Backed Content Generator (Grounded Claims Only)
+7. MCP Server Tools Dispatch & Tenant Authorization (Rejection of User IDs, Scoped API Keys)
 """
 import pytest
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 from cryptography.fernet import Fernet
 
-from app.core.config import settings
-from app.models.models import User, Task, Commit, Event, GraphEdge, Project, Observation, Assessment
-from app.services.crypto import encrypt_secret, decrypt_secret, rotate_secret, DecryptionError
+from app.core.config import Settings, validate_security_configuration, DEV_ENCRYPTION_KEY, DEV_WEBHOOK_SECRET
+from app.models.models import User, Task, Commit, Event, GraphEdge, Project, Observation, Assessment, ApiKey
+from app.services.crypto import encrypt_secret, decrypt_secret, rotate_secret, DecryptionError, CryptoError
 from app.services.graph_engine import GraphEngine
 from app.services.observation_engine import ObservationEngine, compute_evidence_hash
 from app.services.assessment_engine import AssessmentEngine
@@ -48,13 +49,21 @@ class TestCredentialEncryption:
         legacy = "ghp_legacy_personal_access_token_1234"
         assert decrypt_secret(legacy) == legacy
 
+    def test_no_encryption_key_raises_crypto_error(self):
+        """Verifies that absence of ENCRYPTION_KEY raises CryptoError and never silently falls back to SECRET_KEY."""
+        from app.core.config import settings
+        with patch.object(settings, "ENCRYPTION_KEY", ""):
+            with pytest.raises(CryptoError, match="ENCRYPTION_KEY is not configured"):
+                encrypt_secret("sensitive_token")
+
     def test_key_rotation_and_multikey(self):
+        from app.core.config import settings
         old_key = Fernet.generate_key().decode()
         new_key = Fernet.generate_key().decode()
 
         # Encrypt with old_key
         with patch.object(settings, "ENCRYPTION_KEY", old_key), \
-             patch.object(settings, "PREVIOUS_ENCRYPTION_KEYS", None):
+             patch.object(settings, "PREVIOUS_ENCRYPTION_KEYS", ""):
             cipher_old = encrypt_secret("database_password_999")
             assert cipher_old.startswith("v1:")
 
@@ -70,8 +79,83 @@ class TestCredentialEncryption:
 
         # Verify rotated ciphertext decrypts with new_key alone
         with patch.object(settings, "ENCRYPTION_KEY", new_key), \
-             patch.object(settings, "PREVIOUS_ENCRYPTION_KEYS", None):
+             patch.object(settings, "PREVIOUS_ENCRYPTION_KEYS", ""):
             assert decrypt_secret(rotated) == "database_password_999"
+
+
+class TestStartupValidation:
+    """Verifies that production security validation fails startup if any security invariant is violated."""
+
+    def test_production_fails_with_insecure_secret_key(self):
+        s = Settings(
+            APP_ENV="production",
+            SECRET_KEY="change-me-in-production",
+            ENCRYPTION_KEY=Fernet.generate_key().decode(),
+            GITHUB_WEBHOOK_SECRET="secure_webhook_secret_1234567890",
+        )
+        with pytest.raises(RuntimeError, match="Insecure SECRET_KEY"):
+            validate_security_configuration(s)
+
+    def test_production_fails_with_empty_encryption_key(self):
+        s = Settings(
+            APP_ENV="production",
+            SECRET_KEY="a" * 32,
+            ENCRYPTION_KEY="",
+            GITHUB_WEBHOOK_SECRET="secure_webhook_secret_1234567890",
+        )
+        with pytest.raises(RuntimeError, match="ENCRYPTION_KEY is mandatory"):
+            validate_security_configuration(s)
+
+    def test_production_fails_with_default_dev_encryption_key(self):
+        s = Settings(
+            APP_ENV="production",
+            SECRET_KEY="a" * 32,
+            ENCRYPTION_KEY=DEV_ENCRYPTION_KEY,
+            GITHUB_WEBHOOK_SECRET="secure_webhook_secret_1234567890",
+        )
+        with pytest.raises(RuntimeError, match="cannot use the default development key"):
+            validate_security_configuration(s)
+
+    def test_production_fails_with_invalid_encryption_key(self):
+        s = Settings(
+            APP_ENV="production",
+            SECRET_KEY="a" * 32,
+            ENCRYPTION_KEY="not-a-valid-fernet-key",
+            GITHUB_WEBHOOK_SECRET="secure_webhook_secret_1234567890",
+        )
+        with pytest.raises(RuntimeError, match="ENCRYPTION_KEY is invalid"):
+            validate_security_configuration(s)
+
+    def test_production_fails_with_missing_webhook_secret(self):
+        s = Settings(
+            APP_ENV="production",
+            SECRET_KEY="a" * 32,
+            ENCRYPTION_KEY=Fernet.generate_key().decode(),
+            GITHUB_WEBHOOK_SECRET="",
+        )
+        with pytest.raises(RuntimeError, match="GITHUB_WEBHOOK_SECRET is mandatory"):
+            validate_security_configuration(s)
+
+    def test_production_fails_when_webhook_secret_equals_secret_key(self):
+        shared_secret = "a" * 32
+        s = Settings(
+            APP_ENV="production",
+            SECRET_KEY=shared_secret,
+            ENCRYPTION_KEY=Fernet.generate_key().decode(),
+            GITHUB_WEBHOOK_SECRET=shared_secret,
+        )
+        with pytest.raises(RuntimeError, match="GITHUB_WEBHOOK_SECRET must be distinct from SECRET_KEY"):
+            validate_security_configuration(s)
+
+    def test_production_succeeds_with_valid_isolated_keys(self):
+        s = Settings(
+            APP_ENV="production",
+            SECRET_KEY="a" * 32,
+            ENCRYPTION_KEY=Fernet.generate_key().decode(),
+            GITHUB_WEBHOOK_SECRET="b" * 32,
+        )
+        # Should not raise
+        validate_security_configuration(s)
 
 
 class TestEvidenceHash:
@@ -95,7 +179,6 @@ async def test_graph_and_correlation_logic():
     commit_msg = "[TRO-11111111-2222-3333-4444-555555555555] feat: initial graph support"
     committed_at = datetime.utcnow()
 
-    # Mock Task query to simulate explicit tag match
     mock_task = Task(id="11111111-2222-3333-4444-555555555555", user_id=user_id, goal="Build graph", target_level=3)
     mock_scalar = MagicMock()
     mock_scalar.scalar_one_or_none.return_value = mock_task
@@ -188,7 +271,6 @@ async def test_assessment_engine_v4():
         assert 0.0 <= a.score <= 100.0
         assert 0.0 <= a.confidence <= 1.0
 
-    # Test telemetry-grounded validation:
     # 1. Zero AI prompts should result in score 0.0 with "no_ai_interactions_detected", not 100.0
     ai_dim = dims["ai_leverage_effectiveness"]
     assert ai_dim.score == 0.0
@@ -246,7 +328,6 @@ async def test_content_generator_grounded_claims():
     assert "Implement deterministic observations" in post_body
 
     # Verification: Must strictly adhere to "Evidence before claims"
-    # Never claim unmeasured properties like "100% test coverage" or "reviewed"
     assert "100% test coverage" not in post_body
     assert "reviewed" not in post_body.lower()
 
@@ -258,50 +339,55 @@ async def test_mcp_server_tenant_isolation():
     assert resp_unauth.get("authenticated") is False
     assert "Authentication failed" in resp_unauth.get("error", "")
 
-    # 2. Calling with invalid api_key fails authorization
+    # 2. CRITICAL NEGATIVE TEST: Passing a User ID ("usr_alice") as a credential MUST FAIL
+    # A user ID is an identifier, not a credential.
     with patch("app.mcp.server.AsyncSessionLocal") as mock_session:
         db_mock = AsyncMock()
         mock_session.return_value.__aenter__.return_value = db_mock
 
-        # User lookup returns None
+        # Lookup returns None because usr_alice is neither an API key nor a session token
         mock_res = MagicMock()
         mock_res.scalar_one_or_none.return_value = None
         db_mock.execute.return_value = mock_res
 
-        resp_invalid = await handle_tool_call("get_engineering_audit", {"api_key": "invalid_key"})
-        assert resp_invalid.get("authenticated") is False
+        resp_user_id = await handle_tool_call("get_engineering_audit", {"api_key": "usr_alice"})
+        assert resp_user_id.get("authenticated") is False
+        assert "Authentication failed" in resp_user_id.get("error", "")
 
-    # 3. Calling with valid tenant credentials resolves scoped tenant data
+    # 3. Calling with a cryptographically valid, scoped API key ("tro_live_...") succeeds
     with patch("app.mcp.server.AsyncSessionLocal") as mock_session:
         db_mock = AsyncMock()
         mock_session.return_value.__aenter__.return_value = db_mock
 
         test_user = User(id="usr_alice", email="alice@example.com", name="Alice")
-        
-        # 1. UserSession lookup returns None
-        mock_session_res = MagicMock()
-        mock_session_res.scalar_one_or_none.return_value = None
+        mock_api_key = ApiKey(
+            id="key_1",
+            user_id="usr_alice",
+            key_hash="hash",
+            scopes="read,write,mcp",
+            revoked=False,
+            expires_at=None,
+        )
 
-        # 2. User lookup by ID returns test_user
+        mock_key_res = MagicMock()
+        mock_key_res.scalar_one_or_none.return_value = mock_api_key
+
         mock_user_res = MagicMock()
         mock_user_res.scalar_one_or_none.return_value = test_user
 
-        # 3. Tasks lookup
         mock_tasks_res = MagicMock()
         mock_tasks_res.scalars.return_value.all.return_value = [
             Task(id="t1", user_id="usr_alice", goal="Isolation test", status="completed")
         ]
 
-        # 4. Commits lookup
         mock_commits_res = MagicMock()
         mock_commits_res.scalars.return_value.all.return_value = [
             Commit(id="c1", user_id="usr_alice", sha="abc1234", message="feat: isolation")
         ]
 
-        # Sequence of execute calls: UserSession -> User -> Tasks -> Commits
-        db_mock.execute.side_effect = [mock_session_res, mock_user_res, mock_tasks_res, mock_commits_res]
+        db_mock.execute.side_effect = [mock_key_res, mock_user_res, mock_tasks_res, mock_commits_res]
 
-        resp_auth = await handle_tool_call("get_engineering_audit", {"api_key": "usr_alice"})
+        resp_auth = await handle_tool_call("get_engineering_audit", {"api_key": "tro_live_validapikey1234567890"})
         assert resp_auth.get("tenant_id") == "usr_alice"
         assert resp_auth.get("total_tasks") == 1
         assert resp_auth.get("completed_tasks") == 1

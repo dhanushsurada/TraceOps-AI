@@ -3,14 +3,17 @@ TraceOps AI — Strict Multi-Tenant Isolation & Authentication Acceptance Test S
 
 Verifies:
 1. Mandatory Authentication: User-facing and machine endpoints strictly reject unauthenticated calls (HTTP 401).
-2. Multi-Tenant Data Isolation: User A cannot read, mutate, or observe User B's tasks, projects, events, graphs, assessments, or reports.
-3. Webhook Signature Security: Unsigned or invalidly signed webhooks are rejected with HTTP 401.
+2. Credential Security: User IDs are strictly rejected as credentials (HTTP 401). Scoped API keys (tro_live_...) and session tokens are required.
+3. Multi-Tenant Data Isolation: User A cannot read, mutate, or observe User B's tasks, projects, events, graphs, assessments, or reports.
+4. Dedicated Webhook Secret: Fallback to SECRET_KEY is forbidden; requests signed with SECRET_KEY are rejected (HTTP 401).
+5. Unambiguous Webhook Mapping: Colliding repository registrations require explicit disambiguation; ambiguity raises HTTP 409 Conflict.
 """
 import hmac
 import hashlib
 import json
 import os
 import tempfile
+from unittest.mock import patch
 import pytest
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
@@ -20,7 +23,7 @@ from main import app
 from app.core.config import settings
 from app.core.database import get_db, Base
 from app.models.models import User
-from app.services.auth import create_session
+from app.services.auth import create_session, create_api_key
 
 
 @pytest.fixture(scope="module")
@@ -48,11 +51,15 @@ def test_setup():
             # Create sessions
             token_a = await create_session(session, "usr_alice")
             token_b = await create_session(session, "usr_bob")
+
+            # Create scoped API Key for User A
+            raw_key_a, _ = await create_api_key(session, "usr_alice", name="Alice CLI Key", scopes="read,write,mcp")
+
             await session.commit()
 
-            return token_a, token_b
+            return token_a, token_b, raw_key_a
 
-    token_a, token_b = asyncio.run(init_db())
+    token_a, token_b, raw_key_a = asyncio.run(init_db())
 
     async def override_get_db():
         async with TestingSessionLocal() as session:
@@ -65,8 +72,10 @@ def test_setup():
         "client": client,
         "token_a": token_a,
         "token_b": token_b,
+        "api_key_a": raw_key_a,
         "headers_a": {"Authorization": f"Bearer {token_a}"},
         "headers_b": {"Authorization": f"Bearer {token_b}"},
+        "api_key_headers_a": {"Authorization": f"Bearer {raw_key_a}"},
     }
 
     app.dependency_overrides.clear()
@@ -76,6 +85,19 @@ def test_setup():
 
 class TestUnauthenticatedRejection:
     """Verifies that all user-facing and machine endpoints enforce authentication."""
+
+    def test_user_id_rejected_as_credential(self, test_setup):
+        """CRITICAL: User ID is an identifier, not a credential. Must be rejected with 401."""
+        client = test_setup["client"]
+        resp = client.get("/projects/", headers={"Authorization": "Bearer usr_alice"})
+        assert resp.status_code == 401
+
+    def test_scoped_api_key_accepted(self, test_setup):
+        """Verifies that cryptographically secure, scoped API key (tro_live_...) authenticates successfully."""
+        client = test_setup["client"]
+        headers = test_setup["api_key_headers_a"]
+        resp = client.get("/projects/", headers=headers)
+        assert resp.status_code == 200
 
     def test_task_endpoints_require_auth(self, test_setup):
         client = test_setup["client"]
@@ -133,7 +155,7 @@ class TestUnauthenticatedRejection:
 
 
 class TestWebhookSecurity:
-    """Verifies that webhook receivers enforce HMAC-SHA256 signature verification."""
+    """Verifies dedicated secret enforcement and deterministic tenant mapping."""
 
     def test_unsigned_github_webhook_rejected(self, test_setup):
         client = test_setup["client"]
@@ -153,10 +175,39 @@ class TestWebhookSecurity:
         assert resp.status_code == 401
         assert "Invalid GitHub webhook signature" in resp.json()["detail"]
 
+    def test_webhook_signed_with_general_secret_key_rejected(self, test_setup):
+        """CRITICAL: Webhook signed with SECRET_KEY must be rejected. Dedicated GITHUB_WEBHOOK_SECRET is mandatory."""
+        client = test_setup["client"]
+        payload_bytes = json.dumps({"action": "push", "repository": {"full_name": "org/repo"}}).encode("utf-8")
+        # Sign with general SECRET_KEY (which is distinct from GITHUB_WEBHOOK_SECRET)
+        wrong_sig = "sha256=" + hmac.new(b"different_general_secret_key_12345", payload_bytes, hashlib.sha256).hexdigest()
+
+        headers = {
+            "X-GitHub-Event": "push",
+            "X-Hub-Signature-256": wrong_sig,
+            "Content-Type": "application/json",
+        }
+        resp = client.post("/event/github", content=payload_bytes, headers=headers)
+        assert resp.status_code == 401
+
+    def test_webhook_without_configured_secret_fails_server_error(self, test_setup):
+        """If GITHUB_WEBHOOK_SECRET is unconfigured, ingestion fails with 500, never falling back to SECRET_KEY."""
+        client = test_setup["client"]
+        payload_bytes = json.dumps({"action": "push", "repository": {"full_name": "org/repo"}}).encode("utf-8")
+        headers = {
+            "X-GitHub-Event": "push",
+            "X-Hub-Signature-256": "sha256=any",
+            "Content-Type": "application/json",
+        }
+        with patch.object(settings, "GITHUB_WEBHOOK_SECRET", ""):
+            resp = client.post("/event/github", content=payload_bytes, headers=headers)
+            assert resp.status_code == 500
+            assert "GITHUB_WEBHOOK_SECRET is mandatory" in resp.json()["detail"]
+
     def test_validly_signed_github_webhook_accepted(self, test_setup):
         client = test_setup["client"]
         payload_bytes = json.dumps({"action": "push", "repository": {"full_name": "org/repo"}}).encode("utf-8")
-        secret = settings.GITHUB_WEBHOOK_SECRET or settings.SECRET_KEY
+        secret = settings.GITHUB_WEBHOOK_SECRET
         sig = "sha256=" + hmac.new(secret.encode(), payload_bytes, hashlib.sha256).hexdigest()
 
         headers = {
@@ -166,6 +217,48 @@ class TestWebhookSecurity:
         }
         resp = client.post("/event/github", content=payload_bytes, headers=headers)
         assert resp.status_code in (200, 201)
+
+    def test_ambiguous_webhook_mapping_policy(self, test_setup):
+        """
+        When two tenants register the same repository slug:
+        - Webhook without unique disambiguation returns 409 Conflict (no arbitrary guessing).
+        - Webhook with explicit X-TraceOps-Tenant-ID routes deterministically.
+        """
+        client = test_setup["client"]
+        headers_a = test_setup["headers_a"]
+        headers_b = test_setup["headers_b"]
+
+        # User A and User B both register 'corp/shared-platform'
+        client.post("/projects/", json={"name": "Shared A", "slug": "corp/shared-platform"}, headers=headers_a)
+        client.post("/projects/", json={"name": "Shared B", "slug": "corp/shared-platform"}, headers=headers_b)
+
+        payload_bytes = json.dumps({
+            "action": "push",
+            "repository": {"full_name": "corp/shared-platform"},
+            "sender": {"id": 999999, "login": "external-contributor"},
+            "commits": [{"id": "c_shared_1", "message": "feat: shared update", "timestamp": "2026-11-15T00:00:00Z"}]
+        }).encode("utf-8")
+
+        secret = settings.GITHUB_WEBHOOK_SECRET
+        sig = "sha256=" + hmac.new(secret.encode(), payload_bytes, hashlib.sha256).hexdigest()
+
+        # 1. Ambiguous webhook without header fails with 409 Conflict
+        headers_ambiguous = {
+            "X-GitHub-Event": "push",
+            "X-Hub-Signature-256": sig,
+            "Content-Type": "application/json",
+        }
+        resp_ambiguous = client.post("/event/github", content=payload_bytes, headers=headers_ambiguous)
+        assert resp_ambiguous.status_code == 409
+        assert "Ambiguous tenant mapping" in resp_ambiguous.json()["detail"]
+
+        # 2. Webhook disambiguated with explicit tenant header routes successfully
+        headers_disambiguated = {
+            **headers_ambiguous,
+            "X-TraceOps-Tenant-ID": "usr_alice",
+        }
+        resp_disambiguated = client.post("/event/github", content=payload_bytes, headers=headers_disambiguated)
+        assert resp_disambiguated.status_code == 201
 
 
 class TestMultiTenantDataIsolation:
@@ -239,7 +332,7 @@ class TestMultiTenantDataIsolation:
         resp_a_events = client.get("/event/", headers=headers_a)
         assert resp_a_events.status_code == 200
         assert len(resp_a_events.json()) >= 1
-        assert resp_a_events.json()[0]["task_id"] == task_a_id
+        assert any(e.get("task_id") == task_a_id for e in resp_a_events.json())
 
         resp_b_events = client.get("/event/", headers=headers_b)
         assert resp_b_events.status_code == 200

@@ -46,11 +46,33 @@ class User(Base):
 
     integrations: Mapped[List["Integration"]] = relationship("Integration", back_populates="user", cascade="all, delete-orphan")
     sessions:     Mapped[List["UserSession"]] = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
+    api_keys:     Mapped[List["ApiKey"]]      = relationship("ApiKey", back_populates="user", cascade="all, delete-orphan")
     projects:     Mapped[List["Project"]]     = relationship("Project", back_populates="user", cascade="all, delete-orphan")
     tasks:        Mapped[List["Task"]]        = relationship("Task", back_populates="user")
     events:       Mapped[List["Event"]]       = relationship("Event", back_populates="user")
     observations: Mapped[List["Observation"]] = relationship("Observation", back_populates="user")
     assessments:  Mapped[List["Assessment"]]  = relationship("Assessment", back_populates="user")
+
+
+class ApiKey(Base):
+    __tablename__ = "api_keys"
+    __table_args__ = (
+        Index("idx_api_keys_hash", "key_hash"),
+        Index("idx_api_keys_user", "user_id"),
+    )
+
+    id: Mapped[str]           = mapped_column(String, primary_key=True, default=gen_uuid)
+    user_id: Mapped[str]      = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    name: Mapped[str]         = mapped_column(String(128), default="Default Key")
+    key_prefix: Mapped[str]   = mapped_column(String(16), nullable=False)
+    key_hash: Mapped[str]     = mapped_column(String(64), unique=True, nullable=False, index=True)
+    scopes: Mapped[str]       = mapped_column(String(256), default="read,write,mcp")
+    revoked: Mapped[bool]     = mapped_column(Boolean, default=False)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped["User"]      = relationship("User", back_populates="api_keys")
 
 
 class UserSession(Base):

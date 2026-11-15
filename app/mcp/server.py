@@ -17,9 +17,10 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import select
+from app.core.config import settings
 from app.core.database import AsyncSessionLocal
-from app.models.models import Task, Commit, ErrorRecord, User, UserSession
-from app.services.auth import get_user_from_session
+from app.models.models import Task, Commit, ErrorRecord, User, UserSession, ApiKey
+from app.services.auth import get_user_from_session, verify_api_key
 from app.services.graph_engine import GraphEngine
 
 AUTH_SCHEMA = {
@@ -82,17 +83,41 @@ TOOLS = [
 
 
 async def _resolve_tenant_user(db, api_key: Optional[str]) -> Optional[User]:
-    """Resolve authenticated tenant User from API key or session token."""
-    key = api_key or os.environ.get("TRACEOPS_API_KEY")
-    if not key:
+    """
+    Resolve authenticated tenant User from verified credential.
+    Accepts:
+    1. Scoped API Key (tro_live_...)
+    2. Valid Session Token
+    3. Dedicated Service Account Key (TRACEOPS_API_KEY paired with TRACEOPS_SERVICE_TENANT_ID)
+
+    SECURITY: User ID fallback is strictly rejected. An identifier is not a credential.
+    """
+    key = api_key or os.environ.get("TRACEOPS_API_KEY") or settings.TRACEOPS_API_KEY
+    if not key or not isinstance(key, str):
         return None
-    # 1. Check session token
+
+    # Dedicated Service Account Key check
+    service_key = os.environ.get("TRACEOPS_API_KEY") or settings.TRACEOPS_API_KEY
+    if service_key and key == service_key:
+        service_tenant = os.environ.get("TRACEOPS_SERVICE_TENANT_ID") or settings.TRACEOPS_SERVICE_TENANT_ID
+        if service_tenant:
+            u_res = await db.execute(select(User).where(User.id == service_tenant, User.is_active == True))
+            return u_res.scalar_one_or_none()
+        return None
+
+    # 1. Scoped API key
+    if key.startswith("tro_"):
+        user = await verify_api_key(db, key, required_scope="mcp")
+        if user:
+            return user
+
+    # 2. Session token
     user = await get_user_from_session(db, key)
     if user:
         return user
-    # 2. Check direct user ID (for development / local tests)
-    u_res = await db.execute(select(User).where(User.id == key))
-    return u_res.scalar_one_or_none()
+
+    # User ID fallback is completely forbidden
+    return None
 
 
 async def handle_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
